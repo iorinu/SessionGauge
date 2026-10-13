@@ -17,6 +17,13 @@
 enabled = false
 ttl_ms = 15000
 
+# 任意。agent-resumeが安全に取得するCodexアカウント全体のSession quota
+[sidebar.quota]
+enabled = false
+agent_resume_bin = "agent-resume"
+hermes_home = "~/.hermes"
+poll_interval_seconds = 60
+
 # herdrの表示設定は利用者が明示的に設定します。SessionGaugeは設定ファイルを書き換えません。
 # herdrの設定に次の例を追加すると、対応するpaneに専用tokenを表示できます。
 # [ui.sidebar.agents.rows_by_agent]

@@ -329,9 +329,21 @@ def _live(config, as_json, *, once=True, profile=None):
 def _sidebar_factory(config):
     def factory(inner_config):
         collector = Collector(inner_config)
+        from sessiongauge.quota import QuotaReader
         from sessiongauge.sidebar import SidebarReporter
 
-        reporter = SidebarReporter(enabled=config.sidebar_enabled, ttl_ms=config.sidebar_ttl_ms)
+        quota_reader = QuotaReader(
+            str(config.sidebar_quota_agent_resume_bin),
+            str(config.sidebar_quota_hermes_home),
+            config.sidebar_quota_poll_interval_seconds,
+        )
+        reporter = SidebarReporter(
+            enabled=config.sidebar_enabled,
+            ttl_ms=config.sidebar_ttl_ms,
+            quota_enabled=config.sidebar_quota_enabled,
+            quota_reader=quota_reader,
+            hermes_home=config.sidebar_quota_hermes_home,
+        )
 
         class ReportingCollector:
             @property

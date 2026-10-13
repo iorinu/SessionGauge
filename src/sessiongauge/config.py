@@ -14,6 +14,10 @@ class Config:
     sidebar_enabled: bool = False
     sidebar_ttl_ms: int = 15000
     sidebar_time_zone: str = "local"
+    sidebar_quota_enabled: bool = False
+    sidebar_quota_agent_resume_bin: str = "agent-resume"
+    sidebar_quota_hermes_home: Path = Path.home() / ".hermes"
+    sidebar_quota_poll_interval_seconds: int = 60
 
 
 def profile_name_for_path(path: Path, hermes_home: str | Path | None = None) -> str:
@@ -59,6 +63,15 @@ def load_config(
     values["sidebar_enabled"] = sidebar.get("enabled", False)
     values["sidebar_ttl_ms"] = sidebar.get("ttl_ms", 15000)
     values["sidebar_time_zone"] = sidebar.get("time_zone", "local")
+    quota = sidebar.get("quota", {})
+    if not isinstance(quota, dict):
+        raise TypeError("sidebar.quota must be a table")
+    values["sidebar_quota_enabled"] = quota.get("enabled", False)
+    values["sidebar_quota_agent_resume_bin"] = quota.get("agent_resume_bin", "agent-resume")
+    values["sidebar_quota_hermes_home"] = quota.get(
+        "hermes_home", env.get("HERMES_HOME", "~/.hermes")
+    )
+    values["sidebar_quota_poll_interval_seconds"] = quota.get("poll_interval_seconds", 60)
     if "SESSIONGAUGE_SIDEBAR_ENABLED" in env:
         text = env["SESSIONGAUGE_SIDEBAR_ENABLED"].strip().lower()
         if text not in ("1", "0", "true", "false", "yes", "no", "on", "off"):
@@ -90,6 +103,17 @@ def load_config(
         raise ValueError("sidebar ttl_ms must be between 1 and 86400000")
     if not isinstance(values["sidebar_enabled"], bool):
         raise TypeError("sidebar.enabled must be a boolean")
+    if not isinstance(values["sidebar_quota_enabled"], bool):
+        raise TypeError("sidebar.quota.enabled must be a boolean")
+    bin_path = values["sidebar_quota_agent_resume_bin"]
+    if not isinstance(bin_path, str) or not bin_path.strip():
+        raise ValueError("sidebar.quota.agent_resume_bin must be nonempty")
+    bin_path = bin_path.strip()
+    if bin_path.startswith("~"):
+        bin_path = str(Path(bin_path).expanduser())
+    quota_interval = values["sidebar_quota_poll_interval_seconds"]
+    if type(quota_interval) is not int or not 30 <= quota_interval <= 3600:
+        raise ValueError("sidebar.quota.poll_interval_seconds must be between 30 and 3600")
     time_zone = str(values.get("time_zone", "local"))
     if time_zone != "local":
         try:
@@ -135,4 +159,8 @@ def load_config(
         values["sidebar_enabled"],
         ttl,
         str(values["sidebar_time_zone"]),
+        values["sidebar_quota_enabled"],
+        bin_path,
+        Path(values["sidebar_quota_hermes_home"]).expanduser(),
+        quota_interval,
     )

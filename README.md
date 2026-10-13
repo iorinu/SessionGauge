@@ -60,6 +60,9 @@ uv run sessiongauge show <task-id>
 - 独自の監視DBのみを書き込み、所有者限定のディレクトリ/ファイル権限で保護します。
 - cwd、タイトル、時刻、直近の利用状況だけからリンクを推測しません。
 - herdrサイドバーへの報告は明示的なopt-inです。設定を自動変更しません。
+- 任意のアカウントquota表示も既定で無効です。有効時は既存の `agent-resume` CLIだけを呼び出します。認証ストアを直接読み取らず、helperの生JSONはメモリ内で必要な利用率だけを解析し、ログや保存先には出力しません。`account_key` は参照しません。
+
+アカウントquotaの詳細と設定例は[セットアップ・運用](docs/setup.md)を参照してください。表示される `5h` はCodexアカウントのprimary Session quotaで、SessionGaugeのセッショントークン数ではありません。
 
 ライブJSON出力は各pollでflushするため、`live --json` をパイプした場合も行単位で受け取れます。Pane名が汎用的なHermes端末名で、Session IDが確定照合できた場合はHermes Sessionのタイトルを表示名に使います。タイトルはリンク判定には使いません。
 

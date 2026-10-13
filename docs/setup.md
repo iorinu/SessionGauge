@@ -86,6 +86,20 @@ uv run sessiongauge export --days 7 --format json --output usage.json
 
 表示側はherdrの設定へ利用者が明示的に追加してください。ドキュメント例は `config.example.toml` にあります。SessionGaugeは設定を自動変更せず、実機でのサイドバー描画も保証しません。
 
+herdrのmetadata送信は、成功時に標準出力が空でも終了コード `0` なら成功として扱います。headless環境で実行確認する場合は、既定の監視DBを使わず、別のデータディレクトリを指定できます（JSON出力は破棄します）。
+
+### アカウントquota表示（任意）
+
+`agent-resume` を別途インストールし、Hermesで利用中のCodexアカウントを設定したうえで、`[sidebar.quota]` の `enabled = true` を指定します。設定項目は `agent_resume_bin`（既定 `agent-resume`）、`hermes_home`（既定 `~/.hermes`、`~` 展開）、`poll_interval_seconds`（30〜3600秒、既定60）です。CLIは `agent-resume usage --agent hermes --hermes-home <home>` を引数配列で起動し、timeoutは35秒です。shell起動はせず、stdout/stderrやエラー本文を表示しません。
+
+quotaはアカウント全体の値です。Hermes homeの `state.db` に対応するprofile UUIDに正確に照合できたpaneだけに ` · 5h 57%` のように追加します。他profileには表示しません。CLIが未導入・失敗・応答不正の場合は対象paneで ` · 5h N/A` とし、通常のトークン表示を継続します。ポーリング値はメモリ内に限り、エクスポートや監視DBへ保存しません。
+
+`5h` はCodexのアカウントprimary Session利用枠であり、Hermes会話のセッショントークン数ではありません。helperが公開する `primary` limit windowは `limit_window_seconds = 18000`（5時間）です。契約は [Hermes slash commands](https://hermes-agent.nousresearch.com/docs/reference/slash-commands) と [`agent-resume` の usage出力仕様](https://github.com/iorinu/agent-resume#usage) を参照してください。
+
+```sh
+uv run --no-sync python -m sessiongauge --data-dir ~/.local/share/sessiongauge/sidebar live --json --sidebar >/dev/null
+```
+
 ## 更新・アンインストール
 
 uv toolとしてインストールした場合:

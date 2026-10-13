@@ -5,13 +5,25 @@ import subprocess
 import sys
 import time
 import uuid
+from pathlib import Path
 
 from sessiongauge.adapters.herdr import HerdrAdapter
+from sessiongauge.quota import QuotaReader
 
 
 class SidebarReporter:
     def __init__(
-        self, *, enabled=False, ttl_ms=15000, runner=None, adapter=None, source=None, warning=None
+        self,
+        *,
+        enabled=False,
+        ttl_ms=15000,
+        runner=None,
+        adapter=None,
+        source=None,
+        warning=None,
+        quota_enabled=False,
+        quota_reader=None,
+        hermes_home="~/.hermes",
     ):
         self.enabled = enabled
         self.ttl_ms = ttl_ms
@@ -24,6 +36,16 @@ class SidebarReporter:
         self._owned = {}
         self._last_seq = 0
         self._counter = 0
+        self.quota_enabled = quota_enabled
+        self.quota_reader = quota_reader or QuotaReader(
+            hermes_home=str(Path(hermes_home).expanduser())
+        )
+        self.quota_profile_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                str((Path(hermes_home).expanduser() / "state.db").resolve(strict=False)),
+            )
+        )
 
     def _run(self, args):
         return self.runner(args, capture_output=True, text=True, timeout=5, check=False)
@@ -102,13 +124,17 @@ class SidebarReporter:
             args.extend(["--token", f"sessiongauge_usage={token}", "--ttl-ms", str(self.ttl_ms)])
         try:
             result = self._run(args)
-            payload = json.loads(result.stdout)
-            ok = (
-                result.returncode == 0
-                and isinstance(payload, dict)
-                and isinstance(payload.get("result"), dict)
-                and payload["result"].get("type") == "ok"
-            )
+            if result.returncode != 0:
+                ok = False
+            elif not result.stdout.strip():
+                ok = True
+            else:
+                payload = json.loads(result.stdout)
+                ok = (
+                    isinstance(payload, dict)
+                    and isinstance(payload.get("result"), dict)
+                    and payload["result"].get("type") == "ok"
+                )
             if not ok:
                 self.warning("herdr metadata request failed; sidebar value will expire")
             return ok
@@ -133,6 +159,7 @@ class SidebarReporter:
             and counts.get((row.get("session") or {}).get("id")) != 1
         )
         live = {}
+        quota_targets = set()
         try:
             current = self.adapter.list_panes()
         except (OSError, ValueError, subprocess.SubprocessError, TypeError):
@@ -166,7 +193,11 @@ class SidebarReporter:
                 and (not observed_panes or any(p.endpoint == old.endpoint for old in expected))
             ]
             if len(pane) == 1:
-                live[(pane[0].endpoint, pane_id, terminal_id)] = (sid, session["total_tokens"])
+                key = (pane[0].endpoint, pane_id, terminal_id)
+                live[key] = (sid, session["total_tokens"])
+                if self.quota_enabled and row.get("profile") == self.quota_profile_id:
+                    quota_targets.add(key)
+        quota = self.quota_reader.read() if self.quota_enabled and quota_targets else None
         for key in self._owned.keys() - live.keys():
             if key[1] in blocked:
                 continue
@@ -180,7 +211,10 @@ class SidebarReporter:
         for key, (sid, tokens) in live.items():
             if key in self._owned and self._owned[key] != sid:
                 self._send(key[1], clear=True)
-            if self._send(key[1], token=tokens):
+            token = str(tokens)
+            if key in quota_targets:
+                token += f" · 5h {quota:g}%" if quota is not None else " · 5h N/A"
+            if self._send(key[1], token=token):
                 self._owned[key] = sid
 
     def _clear_all(self):

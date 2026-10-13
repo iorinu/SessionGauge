@@ -40,7 +40,9 @@
 | 18 | 再起動後のtask継続と区間gapの扱い | `test_restart_persistent_task_but_gap_unattributed` — `tests/test_mapping_lifecycle.py` | fixture integration |
 | 19 | 80列の本文行で数値セルを幅内の単位付き概数にし、丸め境界・非有限値を処理 | `test_body_row_compacts_each_numeric_cell_to_its_column_width`; `test_width_compaction_rounding_and_non_finite_values` — `tests/test_tui.py` | unit |
 
-## 最終統合チェック
+## 初回統合チェック（履歴）
+
+以下は初回統合時点の検証記録であり、現在のテスト件数・実機状態を示すものではありません。
 
 | コマンド | 結果 |
 |---|---|
@@ -50,21 +52,23 @@
 | `uv build` | sdist / wheel ともにbuild成功 |
 | `uv run --isolated --no-project --python 3.11 --with ./dist/sessiongauge-0.1.0-py3-none-any.whl --with pytest pytest -q` | 92 passed（0.34s） |
 
-TUIワーカーで `session: null` のPaneが混在するケースと、収集時刻を最終活動時刻より優先するケースを追加して確認。修正後の実PTY検証も成功しました。詳細は「統合後の追加実機確認」に記載しています。
+初回統合時、TUIワーカーで `session: null` のPaneが混在するケースと、収集時刻を最終活動時刻より優先するケースを追加して確認しました。修正後の実PTY検証も成功しました。これは初回フェーズの記録です。
 
 80列の合成データ本文行（`>fixture`）: `>fixture       p1    working N/A       123.5M~ 42      987.65M~ 123.5M~ $123k~  `。Input / CacheRead / Total / EstUSDすべてに単位・概数記号が出ており、本文行全体は80列以内。
 
-Python 3.11の隔離環境では、ビルドしたwheelをインストールして92件を再実行しました。pytestの設定にsrcへのpythonpath追加はなく、テスト用conftestもsrcをsys.pathへ挿入しません。独立したwheelのimport確認でもsite-packagesからロードされることを確認しています。
+初回統合時、Python 3.11の隔離環境でビルドしたwheelをインストールして92件を再実行しました。pytestの設定にsrcへのpythonpath追加はなく、テスト用conftestもsrcをsys.pathへ挿入しません。独立したwheelのimport確認でもsite-packagesからロードされることを確認しました。
 
 ## 未検証・制限
 
-- sidebar metadataの実機送信、clear、実際の描画（実機確認時は無効）。
+- sidebar quota metadataの実際の描画、およびmetadata clear（clearはunit testのみ）。
 - 実データでのprofile間ID衝突、全ての移動・再開・compression分岐。
 - 30 active panesの実機stress、Linuxおよび未確認version。
 - モデル切替途中の正確なmodel別分割、実費取得（調査時 `actual_cost_usd` はNULL）。
 - 観測開始前の履歴と中断/再開時の所有関係。期間境界をまたぐ区間は除外されlower boundとなる。
 
-## 統合後の追加実機確認
+## 初回統合後の追加実機確認（履歴）
+
+以下はsidebar quota metadataの実機送信を行う前の初回フェーズの記録です。現在の状態は次節を参照してください。
 
 - 独立した一時データディレクトリで `live --json --no-sidebar --poll-interval-seconds 2` を継続実行し、2つのJSONフレームを受信。両方ともhealthy、stale=false、15 Pane中3件がmatchedでした。初回調査の21 Paneとは確認時点が異なります。
 - Ctrl-C相当のSIGINTで終了コード130。これはCLIの中断時の仕様です。TUIのq終了コード0とは区別します。
@@ -73,4 +77,24 @@ Python 3.11の隔離環境では、ビルドしたwheelをインストールし�
 - 最終ソースを実PTYの80列×30行で起動し、pyteで制御シーケンスを復元した画面にHEALTHYと3セッションが表示されることを確認。`?`、`r`、Enter、`f`、`q`を操作し、終了コード0、stderr 0 bytesでした。pyteは検証環境だけの補助ツールで、アプリの依存には追加していません。
 - 形態素解析を使う補助的な日本語文書lintは、Sudachi未導入のため完走していません。これをアプリのRuff検査成功と混同しません。
 
-人によるPTY画面の視覚確認はしていません。SessionGaugeはHermes DBにmode=roで接続し、herdr server設定・利用者設定を変更していません。実機metadata送信も実施していません。
+人によるPTY画面の視覚確認はしていません。初回フェーズではSessionGaugeはHermes DBにmode=roで接続し、herdr server設定・利用者設定を変更せず、実機metadata送信も実施していません。
+
+## 最新フェーズ（2026-10-14）
+
+親セッションで実行した実コマンドと実環境での確認結果です。
+
+| コマンド / 確認 | 結果 |
+|---|---|
+| `uv run --no-sync pytest -q` | 133 passed（0.35s） |
+| `uv run --no-sync ruff check .` | All checks passed |
+| `uv run --no-sync ruff format --check .` | 42 files already formatted |
+| `uv build` | sdist / wheel ともにbuild成功 |
+| Python 3.11隔離環境でfresh wheelをsite-packagesからimportしてpytest | 133 passed（0.36s）。テストはビルド成果物をimport |
+| agent-resume認証済みhelperによるprimary/secondary window設定確認 | primary `limit_window_seconds=18000`、secondary `604800` |
+| 新しいローカル非secret SessionGauge quota設定でbackground monitorの `live --json --sidebar` を実行 | 既存の `sessiongauge_usage` に数値のaccount quotaを追加して送信。herdr live snapshotで3 matched panesへの反映を確認し、次回updateでquota値が実際に増加 |
+| 一時monitor DBを使ったno-sidebar CLI確認 | healthy、3 matched、期待するtarget profile。stderr空、一時ファイルを削除 |
+| OS一時ディレクトリ内の `hermes-verify-*.py` によるherdr設定確認 | symlinkがdotfiles sourceを指すこと、既存display rowと `sessiongauge_usage` reference、keybindings不変を確認。native `herdr config check` 成功後、verifierを削除 |
+
+herdr設定確認は一時verifierを使ったad-hoc確認であり、pytest suiteの一部ではありません。このフェーズではherdr serverの再起動もherdr設定layoutの追加編集も行わず、既存display referenceを再利用しました。SessionGaugeは既存のread-only adapter経由でHermes DBを読み、独立したmonitor DBを所有します。認証情報は既存のagent-resumeにのみ委譲しました。
+
+実際の送信と次回updateでのquota反映は確認済みですが、新しいquotaの実画面描画とlive metadata clearは未確認です（clearはunit testのみ）。live accountの割合・token数・個人パス・IDはここに記録しません。Linux、30 panes、load時の検証も未実施です。

@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from sessiongauge.config import load_config
@@ -23,3 +25,63 @@ def test_sidebar_ttl_validation(tmp_path, value):
     path.write_text(f"[sidebar]\nttl_ms = {value!r}\n")
     with pytest.raises(ValueError):
         load_config(config_path=path, environ={})
+
+
+def test_sidebar_quota_config_and_validation(tmp_path, monkeypatch):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[sidebar.quota]\nenabled = true\nhermes_home = "~/custom"\npoll_interval_seconds = 45\n'
+    )
+    config = load_config(config_path=path, environ={})
+    assert config.sidebar_quota_enabled is True
+    assert config.sidebar_quota_hermes_home == Path.home() / "custom"
+    assert config.sidebar_quota_poll_interval_seconds == 45
+    path.write_text("")
+    defaults = load_config(config_path=path, environ={})
+    assert defaults.sidebar_quota_enabled is False
+    assert defaults.sidebar_quota_agent_resume_bin == "agent-resume"
+    assert defaults.sidebar_quota_hermes_home == Path.home() / ".hermes"
+    assert defaults.sidebar_quota_poll_interval_seconds == 60
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "env-hermes"))
+    assert (
+        load_config(
+            config_path=path, environ={"HERMES_HOME": "~/env-hermes"}
+        ).sidebar_quota_hermes_home
+        == Path.home() / "env-hermes"
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '[sidebar.quota]\nenabled = "yes"\n',
+        '[sidebar.quota]\nagent_resume_bin = "  "\n',
+        "[sidebar.quota]\npoll_interval_seconds = 29\n",
+        "[sidebar.quota]\npoll_interval_seconds = 3601\n",
+        "[sidebar.quota]\npoll_interval_seconds = true\n",
+    ],
+)
+def test_invalid_quota_config_is_rejected(tmp_path, text):
+    path = tmp_path / "config.toml"
+    path.write_text(text)
+    with pytest.raises((TypeError, ValueError)):
+        load_config(config_path=path, environ={})
+
+
+@pytest.mark.parametrize("interval", [30, 3600])
+def test_quota_poll_interval_boundaries(tmp_path, interval):
+    path = tmp_path / "config.toml"
+    path.write_text(f"[sidebar.quota]\npoll_interval_seconds = {interval}\n")
+    assert load_config(config_path=path, environ={}).sidebar_quota_poll_interval_seconds == interval
+
+
+def test_agent_resume_bin_trims_and_expands_home_but_keeps_bare_command(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text('[sidebar.quota]\nagent_resume_bin = " ~/bin/agent-resume "\n')
+    assert load_config(config_path=path, environ={}).sidebar_quota_agent_resume_bin == str(
+        Path.home() / "bin/agent-resume"
+    )
+    path.write_text('[sidebar.quota]\nagent_resume_bin = " agent-resume "\n')
+    assert (
+        load_config(config_path=path, environ={}).sidebar_quota_agent_resume_bin == "agent-resume"
+    )
