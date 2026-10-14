@@ -336,6 +336,17 @@ def _sidebar_factory(config):
             str(config.sidebar_quota_agent_resume_bin),
             str(config.sidebar_quota_hermes_home),
             config.sidebar_quota_poll_interval_seconds,
+            hermes_root=str(
+                getattr(config, "sidebar_quota_hermes_root", Path.home() / ".hermes/hermes-agent")
+            ),
+            hermes_python=(
+                str(config.sidebar_quota_hermes_python)
+                if getattr(config, "sidebar_quota_hermes_python", None)
+                else None
+            ),
+            auth_helper=str(getattr(config, "sidebar_quota_auth_helper", None))
+            if getattr(config, "sidebar_quota_auth_helper", None)
+            else None,
         )
         reporter = SidebarReporter(
             enabled=config.sidebar_enabled,
@@ -343,6 +354,7 @@ def _sidebar_factory(config):
             quota_enabled=config.sidebar_quota_enabled,
             quota_reader=quota_reader,
             hermes_home=config.sidebar_quota_hermes_home,
+            display=getattr(config, "sidebar_display", "percent"),
         )
 
         class ReportingCollector:

@@ -15,13 +15,20 @@
 [sidebar]
 # サイドバー報告は既定で無効。利用者が有効化した場合だけherdrへメタデータを送ります。
 enabled = false
+display = "percent"
+# 5h利用率とコンパクトなtoken数を表示する場合:
+# display = "percent_tokens"
 ttl_ms = 15000
 
-# 任意。agent-resumeが安全に取得するCodexアカウント全体のSession quota
+# 任意。Hermes thread_usage/query_v2から取得する会話ごとの5時間枠利用率
 [sidebar.quota]
 enabled = false
 agent_resume_bin = "agent-resume"
 hermes_home = "~/.hermes"
+hermes_root = "~/.hermes/hermes-agent"
+# 必要な場合のみ指定（既定: <hermes_root>/venv/bin/python）
+# hermes_python = "/path/to/hermes-agent/venv/bin/python"
+# auth_helper = "/path/to/agent-resume/adapters/hermes_bridge.py"
 poll_interval_seconds = 60
 
 # herdrの表示設定は利用者が明示的に設定します。SessionGaugeは設定ファイルを書き換えません。

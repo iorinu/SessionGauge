@@ -19,6 +19,42 @@ def test_sidebar_precedence_and_environment(tmp_path):
     assert config.sidebar_enabled is False
 
 
+def test_sidebar_display_precedence_and_validation(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text('[sidebar]\ndisplay = "percent_tokens"\n')
+    assert load_config(config_path=path, environ={}).sidebar_display == "percent_tokens"
+    assert (
+        load_config(
+            config_path=path,
+            environ={"SESSIONGAUGE_SIDEBAR_DISPLAY": "percent"},
+        ).sidebar_display
+        == "percent"
+    )
+    assert (
+        load_config(
+            config_path=path,
+            environ={"SESSIONGAUGE_SIDEBAR_DISPLAY": "percent_tokens"},
+            cli={"sidebar_display": "percent"},
+        ).sidebar_display
+        == "percent"
+    )
+    path.write_text("")
+    assert load_config(config_path=path, environ={}).sidebar_display == "percent"
+
+
+@pytest.mark.parametrize("value", ["unknown", 42, True])
+def test_sidebar_display_rejects_unknown_or_nonstring_modes(tmp_path, value):
+    path = tmp_path / "config.toml"
+    if isinstance(value, str):
+        path.write_text(f'[sidebar]\ndisplay = "{value}"\n')
+    elif value is True:
+        path.write_text("[sidebar]\ndisplay = true\n")
+    else:
+        path.write_text("[sidebar]\ndisplay = 42\n")
+    with pytest.raises((TypeError, ValueError)):
+        load_config(config_path=path, environ={})
+
+
 @pytest.mark.parametrize("value", [0, 86400001, "nope"])
 def test_sidebar_ttl_validation(tmp_path, value):
     path = tmp_path / "config.toml"
@@ -36,12 +72,22 @@ def test_sidebar_quota_config_and_validation(tmp_path, monkeypatch):
     assert config.sidebar_quota_enabled is True
     assert config.sidebar_quota_hermes_home == Path.home() / "custom"
     assert config.sidebar_quota_poll_interval_seconds == 45
+    path.write_text(
+        '[sidebar.quota]\nhermes_root = "~/agent"\nhermes_python = "~/py"\nauth_helper = "~/bridge.py"\n'
+    )
+    configured = load_config(config_path=path, environ={})
+    assert configured.sidebar_quota_hermes_root == Path.home() / "agent"
+    assert configured.sidebar_quota_hermes_python == Path.home() / "py"
+    assert configured.sidebar_quota_auth_helper == Path.home() / "bridge.py"
     path.write_text("")
     defaults = load_config(config_path=path, environ={})
     assert defaults.sidebar_quota_enabled is False
     assert defaults.sidebar_quota_agent_resume_bin == "agent-resume"
     assert defaults.sidebar_quota_hermes_home == Path.home() / ".hermes"
     assert defaults.sidebar_quota_poll_interval_seconds == 60
+    assert defaults.sidebar_quota_hermes_root == Path.home() / ".hermes/hermes-agent"
+    assert defaults.sidebar_quota_hermes_python is None
+    assert defaults.sidebar_quota_auth_helper is None
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "env-hermes"))
     assert (
         load_config(

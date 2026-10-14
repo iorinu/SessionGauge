@@ -18,6 +18,10 @@ class Config:
     sidebar_quota_agent_resume_bin: str = "agent-resume"
     sidebar_quota_hermes_home: Path = Path.home() / ".hermes"
     sidebar_quota_poll_interval_seconds: int = 60
+    sidebar_quota_hermes_root: Path = Path.home() / ".hermes/hermes-agent"
+    sidebar_quota_hermes_python: Path | None = None
+    sidebar_quota_auth_helper: Path | None = None
+    sidebar_display: str = "percent"
 
 
 def profile_name_for_path(path: Path, hermes_home: str | Path | None = None) -> str:
@@ -63,6 +67,7 @@ def load_config(
     values["sidebar_enabled"] = sidebar.get("enabled", False)
     values["sidebar_ttl_ms"] = sidebar.get("ttl_ms", 15000)
     values["sidebar_time_zone"] = sidebar.get("time_zone", "local")
+    values["sidebar_display"] = sidebar.get("display", "percent")
     quota = sidebar.get("quota", {})
     if not isinstance(quota, dict):
         raise TypeError("sidebar.quota must be a table")
@@ -72,6 +77,9 @@ def load_config(
         "hermes_home", env.get("HERMES_HOME", "~/.hermes")
     )
     values["sidebar_quota_poll_interval_seconds"] = quota.get("poll_interval_seconds", 60)
+    values["sidebar_quota_hermes_root"] = quota.get("hermes_root", "~/.hermes/hermes-agent")
+    values["sidebar_quota_hermes_python"] = quota.get("hermes_python")
+    values["sidebar_quota_auth_helper"] = quota.get("auth_helper")
     if "SESSIONGAUGE_SIDEBAR_ENABLED" in env:
         text = env["SESSIONGAUGE_SIDEBAR_ENABLED"].strip().lower()
         if text not in ("1", "0", "true", "false", "yes", "no", "on", "off"):
@@ -82,6 +90,8 @@ def load_config(
             values["sidebar_ttl_ms"] = int(env["SESSIONGAUGE_SIDEBAR_TTL_MS"])
         except ValueError as exc:
             raise ValueError("SESSIONGAUGE_SIDEBAR_TTL_MS must be an integer") from exc
+    if "SESSIONGAUGE_SIDEBAR_DISPLAY" in env:
+        values["sidebar_display"] = env["SESSIONGAUGE_SIDEBAR_DISPLAY"]
     if "SESSIONGAUGE_SIDEBAR_TIME_ZONE" in env:
         values["sidebar_time_zone"] = env["SESSIONGAUGE_SIDEBAR_TIME_ZONE"]
     if "SESSIONGAUGE_POLL_INTERVAL_SECONDS" in env:
@@ -95,6 +105,9 @@ def load_config(
     if "SESSIONGAUGE_TIME_ZONE" in env:
         values["time_zone"] = env["SESSIONGAUGE_TIME_ZONE"]
     values.update({key: value for key, value in (cli or {}).items() if value is not None})
+    display = values["sidebar_display"]
+    if not isinstance(display, str) or display not in ("percent", "percent_tokens"):
+        raise ValueError("sidebar.display must be 'percent' or 'percent_tokens'")
     try:
         ttl = int(values["sidebar_ttl_ms"])
     except (TypeError, ValueError) as exc:
@@ -114,6 +127,18 @@ def load_config(
     quota_interval = values["sidebar_quota_poll_interval_seconds"]
     if type(quota_interval) is not int or not 30 <= quota_interval <= 3600:
         raise ValueError("sidebar.quota.poll_interval_seconds must be between 30 and 3600")
+
+    def optional_path(name):
+        value = values[name]
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name} must be a nonempty path")
+        return Path(value.strip()).expanduser()
+
+    hermes_root = values["sidebar_quota_hermes_root"]
+    if not isinstance(hermes_root, str) or not hermes_root.strip():
+        raise ValueError("sidebar.quota.hermes_root must be a nonempty path")
     time_zone = str(values.get("time_zone", "local"))
     if time_zone != "local":
         try:
@@ -163,4 +188,8 @@ def load_config(
         bin_path,
         Path(values["sidebar_quota_hermes_home"]).expanduser(),
         quota_interval,
+        Path(hermes_root).expanduser(),
+        optional_path("sidebar_quota_hermes_python"),
+        optional_path("sidebar_quota_auth_helper"),
+        display,
     )

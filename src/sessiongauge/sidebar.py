@@ -5,10 +5,32 @@ import subprocess
 import sys
 import time
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 from sessiongauge.adapters.herdr import HerdrAdapter
 from sessiongauge.quota import QuotaReader
+
+
+def _format_tokens(tokens):
+    """大きなtoken数だけ、整数演算で概算表示する。"""
+    if tokens < 1000:
+        return str(tokens)
+    unit = 1000
+    suffix = "K"
+    for next_suffix in ("M", "B", "T"):
+        if tokens < unit * 1000:
+            break
+        unit *= 1000
+        suffix = next_suffix
+    hundredths = (tokens * 100 + unit // 2) // unit
+    if hundredths >= 100000 and suffix != "T":
+        unit *= 1000
+        suffix = {"K": "M", "M": "B", "B": "T"}[suffix]
+        hundredths = (tokens * 100 + unit // 2) // unit
+    whole, fraction = divmod(hundredths, 100)
+    decimal = f".{fraction:02d}".rstrip("0") if fraction else ""
+    return f"{whole}{decimal}{suffix}"
 
 
 class SidebarReporter:
@@ -24,7 +46,11 @@ class SidebarReporter:
         quota_enabled=False,
         quota_reader=None,
         hermes_home="~/.hermes",
+        display="percent",
     ):
+        if display not in ("percent", "percent_tokens"):
+            raise ValueError("display must be 'percent' or 'percent_tokens'")
+        self.display = display
         self.enabled = enabled
         self.ttl_ms = ttl_ms
         self.runner = runner or subprocess.run
@@ -197,7 +223,53 @@ class SidebarReporter:
                 live[key] = (sid, session["total_tokens"])
                 if self.quota_enabled and row.get("profile") == self.quota_profile_id:
                     quota_targets.add(key)
-        quota = self.quota_reader.read() if self.quota_enabled and quota_targets else None
+        quota = {}
+        if self.quota_enabled and quota_targets:
+            sessions_by_key = {}
+            for row in panes:
+                session = row.get("session") or {}
+                sid = session.get("id")
+                if (
+                    row.get("status") == "matched"
+                    and sid
+                    and row.get("profile") == self.quota_profile_id
+                ):
+                    key = next((k for k, value in live.items() if value[0] == sid), None)
+                    if key in quota_targets:
+                        sessions_by_key[key] = session
+            threads = []
+            for key in sorted(quota_targets, key=lambda item: str(item)):
+                session = sessions_by_key.get(key, {})
+                started = session.get("started_at")
+                created_at = None
+                if isinstance(started, str):
+                    try:
+                        parsed = datetime.fromisoformat(started)
+                        if parsed.tzinfo is not None:
+                            created_at = parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
+                    except ValueError:
+                        pass
+                if isinstance(started, (int, float)) and not isinstance(started, bool):
+                    try:
+                        created_at = (
+                            datetime.fromtimestamp(started, UTC).isoformat().replace("+00:00", "Z")
+                        )
+                    except (OverflowError, OSError, ValueError):
+                        pass
+                threads.append(
+                    {
+                        "thread_id": live[key][0],
+                        "created_at": created_at,
+                        "descendant_thread_ids": [],
+                    }
+                )
+            try:
+                if len(threads) <= 100:
+                    quota = self.quota_reader.read_sessions(threads)
+                if not isinstance(quota, dict):
+                    quota = {}
+            except (OSError, subprocess.SubprocessError, ValueError, TypeError, OverflowError):
+                quota = {}
         for key in self._owned.keys() - live.keys():
             if key[1] in blocked:
                 continue
@@ -211,9 +283,21 @@ class SidebarReporter:
         for key, (sid, tokens) in live.items():
             if key in self._owned and self._owned[key] != sid:
                 self._send(key[1], clear=True)
-            token = str(tokens)
-            if key in quota_targets:
-                token += f" · 5h {quota:g}%" if quota is not None else " · 5h N/A"
+            token = _format_tokens(tokens)
+            if self.display == "percent":
+                value = quota.get(sid) if key in quota_targets else None
+                token = (
+                    f"{value:.2f}".rstrip("0").rstrip(".") + "%"
+                    if isinstance(value, (int, float)) and not isinstance(value, bool)
+                    else "N/A"
+                )
+            elif key in quota_targets:
+                value = quota.get(sid)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    percent = f"{value:.2f}".rstrip("0").rstrip(".")
+                    token = f"5h {percent}% · {token}"
+                else:
+                    token = f"5h N/A · {token}"
             if self._send(key[1], token=token):
                 self._owned[key] = sid
 

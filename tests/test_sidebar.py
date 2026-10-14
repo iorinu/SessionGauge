@@ -72,7 +72,12 @@ def test_disabled_makes_no_commands():
 def test_reports_only_matched_unique_session_and_clears_owned_token():
     runner = Runner()
     reporter = SidebarReporter(
-        enabled=True, ttl_ms=15000, runner=runner, adapter=Adapter(), source="sessiongauge:test"
+        enabled=True,
+        ttl_ms=15000,
+        runner=runner,
+        adapter=Adapter(),
+        source="sessiongauge:test",
+        display="percent_tokens",
     )
     data = {
         "panes": [
@@ -212,9 +217,9 @@ def test_quota_is_only_added_to_unique_matching_target_profile():
     class Quota:
         calls = 0
 
-        def read(self):
+        def read_sessions(self, threads):
             self.calls += 1
-            return 57
+            return {thread["thread_id"]: 57 for thread in threads}
 
     quota = Quota()
     runner = Runner()
@@ -224,6 +229,7 @@ def test_quota_is_only_added_to_unique_matching_target_profile():
         quota_reader=quota,
         runner=runner,
         adapter=BothPanesAdapter(),
+        display="percent_tokens",
     )
     rows = [
         {
@@ -248,23 +254,23 @@ def test_quota_is_only_added_to_unique_matching_target_profile():
         if "--token" in command
     }
     assert writes == {
-        "p1": "sessiongauge_usage=42 · 5h 57%",
+        "p1": "sessiongauge_usage=5h 57% · 42",
         "p2": "sessiongauge_usage=8",
     }
     assert quota.calls == 1
 
 
 @pytest.mark.parametrize("quota_enabled", [False])
-def test_disabled_quota_keeps_exact_target_profile_plain_without_read(quota_enabled):
+def test_disabled_quota_compacts_target_profile_without_read(quota_enabled):
     home = Path("~/.hermes").expanduser()
     profile = str(uuid.uuid5(uuid.NAMESPACE_URL, str((home / "state.db").resolve())))
 
     class Quota:
         calls = 0
 
-        def read(self):
+        def read_sessions(self, threads):
             self.calls += 1
-            return 57
+            return {thread["thread_id"]: 57 for thread in threads}
 
     quota = Quota()
     runner = Runner()
@@ -274,6 +280,7 @@ def test_disabled_quota_keeps_exact_target_profile_plain_without_read(quota_enab
         quota_reader=quota,
         runner=runner,
         adapter=Adapter(),
+        display="percent_tokens",
     )
     reporter.publish(
         {
@@ -283,13 +290,13 @@ def test_disabled_quota_keeps_exact_target_profile_plain_without_read(quota_enab
                     "terminal_id": "t1",
                     "status": "matched",
                     "profile": profile,
-                    "session": {"id": "s", "total_tokens": 42},
+                    "session": {"id": "s", "total_tokens": 1450298},
                 }
             ]
         }
     )
     write = next(command for command in runner.commands if "--token" in command)
-    assert write[write.index("--token") + 1] == "sessiongauge_usage=42"
+    assert write[write.index("--token") + 1] == "sessiongauge_usage=1.45M"
     assert quota.calls == 0
 
 
@@ -298,12 +305,17 @@ def test_quota_failure_keeps_numeric_metadata_and_adds_na():
     profile = str(uuid.uuid5(uuid.NAMESPACE_URL, str((home / "state.db").resolve())))
 
     class Quota:
-        def read(self):
-            return None
+        def read_sessions(self, threads):
+            return {}
 
     runner = Runner()
     reporter = SidebarReporter(
-        enabled=True, quota_enabled=True, quota_reader=Quota(), runner=runner, adapter=Adapter()
+        enabled=True,
+        quota_enabled=True,
+        quota_reader=Quota(),
+        runner=runner,
+        adapter=Adapter(),
+        display="percent_tokens",
     )
     reporter.publish(
         {
@@ -313,13 +325,173 @@ def test_quota_failure_keeps_numeric_metadata_and_adds_na():
                     "terminal_id": "t1",
                     "status": "matched",
                     "profile": profile,
+                    "session": {"id": "s", "total_tokens": 1450298},
+                }
+            ]
+        }
+    )
+    write = next(command for command in runner.commands if "--token" in command)
+    assert write[write.index("--token") + 1] == "sessiongauge_usage=5h N/A · 1.45M"
+
+
+@pytest.mark.parametrize(
+    ("count", "expected"),
+    [
+        (0, "0"),
+        (999, "999"),
+        (1000, "1K"),
+        (1234, "1.23K"),
+        (35394, "35.39K"),
+        (1450298, "1.45M"),
+        (999999, "1M"),
+        (1000000, "1M"),
+        (999999999, "1B"),
+        (1000000000, "1B"),
+        (1000000000000, "1T"),
+        (9223372036854775807, "9223372.04T"),
+    ],
+)
+def test_sidebar_compacts_token_metadata_only_for_target_quota_profile(count, expected):
+    home = Path("~/.hermes").expanduser()
+    profile = str(uuid.uuid5(uuid.NAMESPACE_URL, str((home / "state.db").resolve())))
+
+    class Quota:
+        calls = 0
+
+        def read_sessions(self, threads):
+            self.calls += 1
+            return {thread["thread_id"]: 0 for thread in threads}
+
+    quota = Quota()
+    runner = Runner()
+    reporter = SidebarReporter(
+        enabled=True,
+        quota_enabled=True,
+        quota_reader=quota,
+        runner=runner,
+        adapter=Adapter(),
+        display="percent_tokens",
+    )
+    data = {
+        "panes": [
+            {
+                "pane_id": "p1",
+                "terminal_id": "t1",
+                "status": "matched",
+                "profile": profile,
+                "session": {"id": "s", "total_tokens": count},
+            }
+        ]
+    }
+
+    reporter.publish(data)
+
+    write = next(command for command in runner.commands if "--token" in command)
+    assert write[write.index("--token") + 1] == f"sessiongauge_usage=5h 0% · {expected}"
+    assert data["panes"][0]["session"]["total_tokens"] == count
+    assert quota.calls == 1
+
+
+def test_sidebar_compacts_large_count_with_quota_and_preserves_herdr_prefix():
+    home = Path("~/.hermes").expanduser()
+    profile = str(uuid.uuid5(uuid.NAMESPACE_URL, str((home / "state.db").resolve())))
+
+    class Quota:
+        calls = 0
+
+        def read_sessions(self, threads):
+            self.calls += 1
+            return {thread["thread_id"]: 0 for thread in threads}
+
+    quota = Quota()
+    runner = Runner()
+    reporter = SidebarReporter(
+        enabled=True,
+        quota_enabled=True,
+        quota_reader=quota,
+        runner=runner,
+        adapter=Adapter(),
+        display="percent_tokens",
+    )
+    data = {
+        "panes": [
+            {
+                "pane_id": "p1",
+                "terminal_id": "t1",
+                "status": "matched",
+                "profile": profile,
+                "session": {"id": "s", "total_tokens": 1450298},
+            }
+        ]
+    }
+
+    reporter.publish(data)
+
+    write = next(command for command in runner.commands if "--token" in command)
+    metadata = write[write.index("--token") + 1]
+    assert metadata == "sessiongauge_usage=5h 0% · 1.45M"
+    assert quota.calls == 1
+    assert data["panes"][0]["session"]["total_tokens"] == 1450298
+    display = "hermes · " + metadata.removeprefix("sessiongauge_usage=")
+    assert display.startswith("hermes · 5h")
+    assert len(display) <= 24
+
+
+def test_small_count_metadata_remains_exact():
+    runner = Runner()
+    reporter = SidebarReporter(
+        enabled=True, runner=runner, adapter=Adapter(), display="percent_tokens"
+    )
+    reporter.publish(
+        {
+            "panes": [
+                {
+                    "pane_id": "p1",
+                    "terminal_id": "t1",
+                    "status": "matched",
                     "session": {"id": "s", "total_tokens": 42},
                 }
             ]
         }
     )
     write = next(command for command in runner.commands if "--token" in command)
-    assert write[write.index("--token") + 1] == "sessiongauge_usage=42 · 5h N/A"
+    assert write[write.index("--token") + 1] == "sessiongauge_usage=42"
+
+
+def test_sidebar_large_count_for_other_profile_is_compact_without_quota_read():
+    class Quota:
+        calls = 0
+
+        def read_sessions(self, threads):
+            self.calls += 1
+            return {thread["thread_id"]: 57 for thread in threads}
+
+    quota = Quota()
+    runner = Runner()
+    reporter = SidebarReporter(
+        enabled=True,
+        quota_enabled=True,
+        quota_reader=quota,
+        runner=runner,
+        adapter=BothPanesAdapter(),
+        display="percent_tokens",
+    )
+    reporter.publish(
+        {
+            "panes": [
+                {
+                    "pane_id": "p1",
+                    "terminal_id": "t1",
+                    "status": "matched",
+                    "profile": "other",
+                    "session": {"id": "s", "total_tokens": 1450298},
+                }
+            ]
+        }
+    )
+    write = next(command for command in runner.commands if "--token" in command)
+    assert write[write.index("--token") + 1] == "sessiongauge_usage=1.45M"
+    assert quota.calls == 0
 
 
 def test_cli_factory_wires_configured_quota_reader(monkeypatch):
@@ -351,12 +523,14 @@ def test_cli_factory_wires_configured_quota_reader(monkeypatch):
         sidebar_quota_agent_resume_bin="/usr/local/bin/agent-resume",
         sidebar_quota_hermes_home=Path("~/custom-hermes").expanduser(),
         sidebar_quota_poll_interval_seconds=90,
+        sidebar_display="percent_tokens",
     )
     cli._sidebar_factory(config)(config)
     assert created["quota_enabled"] is True
     assert created["quota_reader"].agent_resume_bin == "/usr/local/bin/agent-resume"
     assert created["quota_reader"].hermes_home == str(config.sidebar_quota_hermes_home)
     assert created["quota_reader"].poll_interval_seconds == 90
+    assert created["display"] == "percent_tokens"
 
 
 def test_unlink_clears_just_owned_token_and_report_does_not_set_labels():
@@ -382,3 +556,298 @@ def test_unlink_clears_just_owned_token_and_report_does_not_set_labels():
     clears = [command for command in runner.commands if "--clear-token" in command]
     assert len(clears) == 1
     assert clears[0][clears[0].index("--source") + 1] == "sessiongauge:test"
+
+
+def test_native_session_percentages_are_bound_to_session_ids():
+    home = Path("~/.hermes").expanduser()
+    profile = str(uuid.uuid5(uuid.NAMESPACE_URL, str((home / "state.db").resolve())))
+
+    class Quota:
+        def __init__(self):
+            self.requests = []
+
+        def read_sessions(self, threads):
+            self.requests.append(threads)
+            return {"s": 113.58442524, "s2": 1.08005576}
+
+        def read(self):
+            raise AssertionError("account quota must never be used")
+
+    quota = Quota()
+    runner = Runner()
+    reporter = SidebarReporter(
+        enabled=True,
+        quota_enabled=True,
+        quota_reader=quota,
+        runner=runner,
+        adapter=BothPanesAdapter(),
+        display="percent_tokens",
+    )
+    data = {
+        "panes": [
+            {
+                "pane_id": "p1",
+                "terminal_id": "t1",
+                "status": "matched",
+                "profile": profile,
+                "session": {
+                    "id": "s",
+                    "total_tokens": 1450298,
+                    "created_at": None,
+                    "descendant_thread_ids": [],
+                },
+            },
+            {
+                "pane_id": "p2",
+                "terminal_id": "t2",
+                "status": "matched",
+                "profile": profile,
+                "session": {
+                    "id": "s2",
+                    "total_tokens": 42,
+                    "created_at": None,
+                    "descendant_thread_ids": [],
+                },
+            },
+        ]
+    }
+
+    reporter.publish(data)
+
+    writes = {
+        command[3]: command[command.index("--token") + 1]
+        for command in runner.commands
+        if "--token" in command
+    }
+    assert writes == {
+        "p1": "sessiongauge_usage=5h 113.58% · 1.45M",
+        "p2": "sessiongauge_usage=5h 1.08% · 42",
+    }
+    assert quota.requests == [
+        [
+            {"thread_id": "s", "created_at": None, "descendant_thread_ids": []},
+            {"thread_id": "s2", "created_at": None, "descendant_thread_ids": []},
+        ]
+    ]
+    assert [row["session"]["total_tokens"] for row in data["panes"]] == [1450298, 42]
+
+
+def test_native_session_percentage_missing_for_one_session_is_na_not_shared():
+    home = Path("~/.hermes").expanduser()
+    profile = str(uuid.uuid5(uuid.NAMESPACE_URL, str((home / "state.db").resolve())))
+
+    class Quota:
+        def read_sessions(self, threads):
+            return {"s": 113.58}
+
+        def read(self):
+            raise AssertionError("account quota must never be used")
+
+    runner = Runner()
+    reporter = SidebarReporter(
+        enabled=True,
+        quota_enabled=True,
+        quota_reader=Quota(),
+        runner=runner,
+        adapter=BothPanesAdapter(),
+        display="percent_tokens",
+    )
+    reporter.publish(
+        {
+            "panes": [
+                {
+                    "pane_id": "p1",
+                    "terminal_id": "t1",
+                    "status": "matched",
+                    "profile": profile,
+                    "session": {
+                        "id": "s",
+                        "total_tokens": 1450298,
+                        "created_at": None,
+                        "descendant_thread_ids": [],
+                    },
+                },
+                {
+                    "pane_id": "p2",
+                    "terminal_id": "t2",
+                    "status": "matched",
+                    "profile": profile,
+                    "session": {
+                        "id": "s2",
+                        "total_tokens": 42,
+                        "created_at": None,
+                        "descendant_thread_ids": [],
+                    },
+                },
+            ]
+        }
+    )
+
+    writes = {
+        command[3]: command[command.index("--token") + 1]
+        for command in runner.commands
+        if "--token" in command
+    }
+    assert writes == {
+        "p1": "sessiongauge_usage=5h 113.58% · 1.45M",
+        "p2": "sessiongauge_usage=5h N/A · 42",
+    }
+
+
+@pytest.mark.parametrize("count,expected_calls", [(100, 1), (101, 0)])
+def test_quota_never_splits_cached_request_into_unpollable_batches(count, expected_calls):
+    home = Path("~/.hermes").expanduser()
+    profile = str(uuid.uuid5(uuid.NAMESPACE_URL, str((home / "state.db").resolve())))
+
+    class ManyPanesAdapter:
+        def list_panes(self):
+            return [
+                Pane("endpoint", f"p{i}", f"t{i}", "hermes", "running", None, None, f"s{i}")
+                for i in range(count)
+            ]
+
+    class Quota:
+        def __init__(self):
+            self.sizes = []
+
+        def read_sessions(self, threads):
+            self.sizes.append(len(threads))
+            return {thread["thread_id"]: 10 for thread in threads}
+
+    quota = Quota()
+    runner = Runner()
+    reporter = SidebarReporter(
+        enabled=True,
+        quota_enabled=True,
+        quota_reader=quota,
+        runner=runner,
+        adapter=ManyPanesAdapter(),
+        display="percent_tokens",
+    )
+    rows = [
+        {
+            "pane_id": f"p{i}",
+            "terminal_id": f"t{i}",
+            "status": "matched",
+            "profile": profile,
+            "session": {"id": f"s{i}", "total_tokens": 1},
+        }
+        for i in range(count)
+    ]
+    reporter.publish({"panes": rows})
+    assert len(quota.sizes) == expected_calls
+    assert all(size <= 100 for size in quota.sizes)
+    if count == 101:
+        writes = [command for command in runner.commands if "--token" in command]
+        assert all("5h N/A" in command[command.index("--token") + 1] for command in writes)
+
+
+def test_cli_factory_uses_hermes_root_for_default_python(monkeypatch, tmp_path):
+    from sessiongauge import cli
+
+    captured = {}
+
+    class CollectorStub:
+        def __init__(self, config):
+            self.monitor = None
+            self.herdr_state = SimpleNamespace(last_success=[])
+
+    class ReporterStub:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def publish(self, *args, **kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(cli, "Collector", CollectorStub)
+    monkeypatch.setattr("sessiongauge.sidebar.SidebarReporter", ReporterStub)
+    root = tmp_path / "hermes-root"
+    config = SimpleNamespace(
+        sidebar_enabled=True,
+        sidebar_ttl_ms=15000,
+        sidebar_quota_enabled=True,
+        sidebar_quota_agent_resume_bin="agent-resume",
+        sidebar_quota_hermes_home=tmp_path,
+        sidebar_quota_poll_interval_seconds=60,
+        sidebar_quota_hermes_root=root,
+    )
+    cli._sidebar_factory(config)(config)
+    assert captured["quota_reader"].hermes_python == str(root / "venv/bin/python")
+
+
+@pytest.mark.parametrize(
+    ("quota_value", "expected"),
+    [
+        (113.58442524, "113.58%"),
+        (0, "0%"),
+        (1.08, "1.08%"),
+        (None, "N/A"),
+    ],
+)
+def test_default_percent_only(quota_value, expected):
+    home = Path("~/.hermes").expanduser()
+    profile = str(uuid.uuid5(uuid.NAMESPACE_URL, str((home / "state.db").resolve())))
+
+    class Quota:
+        def read_sessions(self, threads):
+            return {} if quota_value is None else {"s": quota_value}
+
+    runner = Runner()
+    reporter = SidebarReporter(
+        enabled=True,
+        quota_enabled=True,
+        quota_reader=Quota(),
+        runner=runner,
+        adapter=Adapter(),
+    )
+    reporter.publish(
+        {
+            "panes": [
+                {
+                    "pane_id": "p1",
+                    "terminal_id": "t1",
+                    "status": "matched",
+                    "profile": profile,
+                    "session": {
+                        "id": "s",
+                        "total_tokens": 42,
+                        "created_at": None,
+                        "descendant_thread_ids": [],
+                    },
+                }
+            ]
+        }
+    )
+
+    write = next(command for command in runner.commands if "--token" in command)
+    assert write[write.index("--token") + 1] == f"sessiongauge_usage={expected}"
+
+
+@pytest.mark.parametrize("quota_enabled,profile", [(False, None), (True, "other")])
+def test_default_percent_only_is_na_without_eligible_quota(quota_enabled, profile):
+    class Quota:
+        def read_sessions(self, threads):
+            raise AssertionError("ineligible sidebar values must not be queried")
+
+    runner = Runner()
+    reporter = SidebarReporter(
+        enabled=True,
+        quota_enabled=quota_enabled,
+        quota_reader=Quota(),
+        runner=runner,
+        adapter=Adapter(),
+    )
+    row = {
+        "pane_id": "p1",
+        "terminal_id": "t1",
+        "status": "matched",
+        "session": {"id": "s", "total_tokens": 1450298},
+    }
+    if profile is not None:
+        row["profile"] = profile
+    reporter.publish({"panes": [row]})
+    write = next(command for command in runner.commands if "--token" in command)
+    assert write[write.index("--token") + 1] == "sessiongauge_usage=N/A"
