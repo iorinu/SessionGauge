@@ -1,11 +1,11 @@
 # アーキテクチャ
 
-SessionGaugeはローカルのHermes SQLite DBを読み取り、herdrのPane情報とSession IDを照合します。確認済みのリンクと観測差分を独立した監視DBへ保存し、ライブ表示・履歴・エクスポートに利用します。
+通常の収集経路はHermesのSQLite DBとherdrのPane情報を読み、確かなSession ID対応だけを独自monitor DBへ保存します。任意のquota照会はこの経路から分離され、明示的に有効化したときだけ動きます。
 
 ```mermaid
 flowchart LR
-    H[Hermes state.db / named profiles] -->|SQLite mode=ro; safe columns only| A[HermesDB adapter]
-    R[herdr pane list] -->|exact agent session ID| B[Herdr adapter]
+    H[Hermes state.db / named profiles] -->|SQLite mode=ro; safe columns| A[HermesDB adapter]
+    R[herdr pane list input] -->|exact agent session ID| B[Herdr adapter]
     A --> C[Collector and identity resolver]
     B --> C
     L[Explicit link command] --> C
@@ -14,34 +14,43 @@ flowchart LR
     M --> T
     M --> G[History and aggregation]
     M --> E[CSV / JSON export]
-    C -. optional; explicit opt-in .-> S[herdr metadata reporter]
+    C -->|sidebar opt-in| S[SidebarReporter]
+    S -. quota opt-in and eligible pane .-> Q[QuotaReader]
+    Q --> X[Bundled Hermes usage bridge]
+    X -. credential and URL resolution via existing helper .-> SDK[Hermes SDK]
+    X -->|httpx POST; allowlisted HTTPS query_v2| API[OpenAI thread usage API]
+    API -->|response| X
+    X -->|SID-matched percentage| Q
+    S --> F[Sidebar display formatter]
+    Q --> F
+    F -->|sessiongauge_usage metadata| O[herdr metadata output]
 ```
 
-## データ境界
+## 通常の収集と保存
 
-- Hermes DBはPython標準ライブラリのsqlite3を `mode=ro` で開き、実行時に列を検出します。Hermesのmigrationを起こし得るアプリケーション用DB APIはimportしません。
-- セッションID、モデル、利用量、コスト、時刻、および利用可能なプロジェクト情報など、必要な列だけを読みます。messagesやsystem prompt、ツール引数、APIキーは取得しません。
-- herdrの機械可読Pane一覧から公式integrationが報告する正確なHermes Session IDを使います。cwdやタイトル等は表示・補助情報であり、自動リンク根拠にしません。
-- SessionGaugeが書き込むのは独自monitor DBだけです。既定の保存先は `~/.local/share/sessiongauge/monitor.db` で、所有者限定権限を使います。
-- 外部通信やテレメトリはありません。サイドバー報告を明示的に有効化した場合のみ、herdr CLIへローカルmetadataを送ります。
+- `HermesDB` はPython標準ライブラリのsqlite3でDBを `mode=ro` 接続し、安全な列allowlistだけを読みます。HermesのアプリケーションDB APIをimportせず、migrationを起こしません。
+- herdrの機械可読Pane一覧が報告する正確なHermes Session IDを照合します。cwdやタイトルは表示情報で、identity resolverの根拠にはしません。
+- DB identityとSession IDを組み合わせてprofileを区別します。ID衝突や複数Pane競合など曖昧な場合は `unlinked` / `unattributed` とし、推測で割り当てません。
+- 通常の収集データの永続化先は独自monitor DBです。sidebarを有効にした場合は別途herdrへmetadataを送信します。初回値はbaselineとして保存し、後続の累計値との差を観測区間のusageとして集計します。
+- messages、system prompt、tool argumentsは収集しません。通常の収集は外部通信やtelemetryを行いません。
 
-## 照合と永続化
+## 任意のquota経路
 
-CollectorはPane情報とprofile別のSessionカタログを照合します。DB identityとSession IDを組にして扱うため、異なるprofileの同じIDは混同しません。公式ID、既に保存された関係、利用者の明示リンクを根拠にします。曖昧なID衝突や複数Pane競合は自動帰属させず、unlinked / unattributedとして残します。
+サイドバー報告には `[sidebar] enabled = true` が必要で、quota照会は独立して `[sidebar.quota] enabled = true` も必要です。`Collector` から `SidebarReporter`、formatterを経てherdrへmetadataを送ります。quotaが有効で対象が適格な場合だけ、`SidebarReporter` が `QuotaReader` を呼び、Hermes SDK用Pythonでbundled `hermes_usage_bridge.py` を起動します。bridgeは既存helperを通じてHermes SDKのcredential resolverとURL resolverを利用します。`hermes_root` はSDKのコード配置、`hermes_home` はSDKが使うprofile/home、`hermes_python` はそのSDK環境のPythonを指し、それぞれ別の設定です。
 
-monitor DBにはprofile、task、Pane/Session link、session catalog、累積snapshot、観測区間のusage attributionおよびeventを保存します。初回観測はbaselineであり期間内の増加として数えません。後続の累積値との差を区間値として保存し、履歴は区間値を集計します。観測できない過去の利用量は復元しません。
+bridgeはhttpxで `thread_usage/query_v2` へのHTTPS POSTを行い、`chatgpt.com` と `api.openai.com` の許可済みhostに限定します。認証はAuthorizationヘッダーで行い、利用可能な場合はChatGPT-Account-Idヘッダーも送ります。本文にはSID（thread ID）、開始時刻、空のdescendant ID一覧だけを含めます。会話本文・タイトル・cwd、他のraw response情報は表示・永続化しません。返却値は要求したSIDと対応する `five_hour_limit_percent` だけをメモリ上で保持し、表示formatterへ渡します。
 
-## 集計と表示
+通常の収集に新たな依存はなく、quota bridgeはHermes SDK環境にすでにあるSDKとhttpxを利用します。quota経路は外部通信を行うため、通常のローカル収集とは異なるopt-inの境界です。
 
-- `total_tokens` は `input_tokens + output_tokens`。Cache/Reasoningを追加で合算しません。
-- ライブ表示は累計、最新の観測差分、直近60秒に終了した観測区間の差分（`recent_60s`）を提供します。未観測時間を補間せず、値はminimum observedです。
-- Paneの明示タイトルを優先します。汎用的なHermes端末タイトルの場合のみ、確定照合されたSessionのタイトルを表示名に使います。タイトル/cwdはidentity resolverへ渡す照合根拠ではありません。実効表示名の変更はPane title eventに記録します。
-- 欠損値は0とせず `N/A` 相当として扱います。estimated costとactual costは別項目です。
-- 期間境界をまたぐ区間や、日別集計でローカル午前0時をまたぐ区間は、日付への推定配賦をせず除外してlower boundと注記します。
-- セッション再開、compressionによる分岐、Pane移動などで安全に区間を一意なタスクへ帰属できないデータはunattributedです。
-- 変更のない終了済みSessionは新しいsnapshotを繰り返し追加しません。catalogは最後に取得した情報を保持します。
-- TUIは標準ライブラリのcursesとバックグラウンドcollectorを使います。CLIはargparse、DBはsqlite3、設定はtomllibを使い、ランタイム依存を持ちません。
+bridgeの監査ガードは `.env` / `.env.*` と `.ssh` へのopenを拒否し、相対パスも拒否します。これは子プロセス内の防御層で、OS sandboxではありません。SDK配置や認証helperの選択をSessionGaugeがOS権限境界として強制するものでもありません。
 
-## サイドバー連携
+## サイドバー報告
 
-オプトイン時、reporter固有source、単調増加sequence、TTL付き `sessiongauge_usage` tokenを使います。送信前にPaneの現在状態とSession IDの一致を再確認し、曖昧な対応は報告しません。終了時や対象消失時に所有tokenだけをclearする設計です。herdr側のサイドバー行設定は利用者が行います。送信と表示は別の機能境界であり、実機の描画は未検証です。
+sidebar reporterはPaneの現在状態とSession IDを再確認し、一意に対応するPaneだけにnamespaced `sessiongauge_usage` tokenをTTL付きmetadataとして送信します。終了時や対象消失時にSessionGaugeが所有するtokenをclearします。既定の表示形式は割合のみで、`percent_tokens` は任意の併記形式です。herdr側の行設定は利用者が行います。
+
+## 集計上の扱い
+
+- `total_tokens` は `input_tokens + output_tokens` で、cache/reasoning値を追加合算しません。
+- 観測開始前の使用量は復元しません。観測区間の差分はminimum observedで、未観測時間へ按分しません。
+- 欠損値はゼロとせず `N/A` 相当として扱います。estimated costとactual costは別です。
+- 日付境界をまたぐ区間、または安全に一意なTaskへ割り当てられない区間は推定配賦しません。

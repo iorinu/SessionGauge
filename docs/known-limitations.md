@@ -1,19 +1,28 @@
 # 既知の制限
 
-SessionGaugeはローカルに観測できたHermesの累積値を記録します。実データが存在しない期間や対応関係を推測して補うことはしません。
+SessionGaugeが示すのはローカルで観測できた値です。欠損期間や曖昧な対応関係を推測で埋めません。
 
-- **モデルの時間粒度**: Hermesのセッション累計に付くモデルを区間の最良既知値（`best-known-session-model`）として使います。1セッション中にモデルが変わった場合、区間利用量を各モデルへ正確に分割できません。
-- **導入前の利用量**: 初回に読んだ既存セッションの値はbaselineです。過去の日別・期間別使用量ではなく、導入前の履歴が不明な場合も復元できません。
-- **期間境界**: 開始/終了境界をまたぐ区間や、日別集計でローカル午前0時をまたぐ区間は対象期間へ按分せず除外します。表示値はlower boundになる場合があります。
-- **タスク帰属**: 正確なherdr Session ID、保存済みリンク、または利用者の明示リンクがない場合、タスクへ割り当てません。profile間ID衝突、Pane競合、セッション再開、Pane移動、Hermesの圧縮・分岐も誤帰属を避けて保守的に扱い、帰属不能分はunattributed/unlinkedです。
-- **実費と推定費**: Hermesが提供する推定費と実費を分離します。actual costが未提供なら `N/A` であり、プロバイダーの請求額やinvoiceと一致する保証はありません。
-- **トークン計測時点**: Hermes DBへの書き込み後のポーリングで更新します。生成途中の逐次トークンは測らず、DB書き込み頻度にも依存します。
-- **観測レート**: `recent_60s` は直近60秒内に終了した観測区間の差分です。観測間隔内の発生時刻を特定・按分しないため、実時間の速度計測ではなくminimum observedです。
-- **Task名**: 明示的Pane名を優先し、汎用的なHermes端末名だけを確定照合Sessionのタイトルで補います。タイトルはidentity根拠にしません。Session titleは監視中に変化し得ます。
-- **サイドバー**: metadata送信は明示opt-inで、実機への書き込み・サイドバーの視覚表示は検証していません。herdrの表示設定は利用者が手動で行います。非対応時は通常の監視にフォールバックします。
-- **複数profile**: 複数DBを個別に指定・選択できますが、実環境にある全profile構成や同一ID衝突を網羅して検証したわけではありません。
-- **再開・中断**: 中断/再開時のTask所有関係を確実に復元できない区間はunattributedです。境界をまたぐ区間も対象期間から除外するため、履歴はlower boundになり得ます。
-- **互換性・負荷**: macOS以外や未確認versionの網羅、30 Pane同時稼働の実機負荷は未検証です。
-- **実費**: 実環境調査時の `actual_cost_usd` は全件NULLでした。実費が表示できるとは限りません。
+## 履歴・使用量
 
-従って、history/exportは請求額の確定や完全なタスク別利用量を保証するものではありません。集計の注記、mapping status、baselineを併せて確認してください。
+- **baselineと期間集計**: 初回に読んだ累計値はbaselineです。導入前の日別・期間別使用量は復元できません。
+- **観測時点**: 使用量はHermes DBへの書き込み後のpollで更新されます。生成中の逐次token計測ではありません。`recent_60s` は直近60秒内に終了した観測区間の差分で、実時間の速度や発生時刻を示しません。
+- **期間境界**: 指定期間やローカル午前0時をまたぐ区間を按分せず除外する場合があります。history/exportはlower boundになり得ます。
+- **Taskとprofile**: 正確なherdr Session ID、保存済み関係、明示リンクがない限りTaskに割り当てません。profile間ID衝突、複数Pane競合、session再開、Pane移動、圧縮・分岐では誤帰属を避け、`unlinked` / `unattributed` とする場合があります。
+- **modelとcost**: セッション累計のmodelを区間のbest-known値として使うため、途中でmodelが変わった場合に正確なmodel別配分はできません。actual costが提供されない場合は `N/A` で、請求額との一致を保証しません。
+
+## quota表示
+
+- 表示値はAPIが返す `five_hour_limit_percent` のbudget換算割合です。「現在の5時間windowだけ」の使用率と確認されたものではなく、token数やアカウント全体の残量でもありません。100%超もそのまま表示します。
+- 利用可能な値だけを表示します。部分データ、欠損、無効な数値、照会失敗、未対応SIDは `N/A` です。token数や別SID・アカウント全体の値で埋めません。
+- native APIは一度に最大100件のroot threadを照会します。対象が101件以上なら全対象が `N/A` になります。子threadの利用量は合算しません。
+- 対象はquota設定の `hermes_home` に対応するprofileの、一意に照合できたSIDです。他profile、quota無効時にはquotaを取得しません。割合のみ表示が既定で、旧token数との併記は `percent_tokens` を明示した場合だけです。
+- 照会間隔は既定60秒、設定範囲30〜3600秒です。SID別の値はメモリ内に保持しますが、poll間隔はbatch全体に適用されます。新SIDは次batchまでpendingの `N/A` となり、batch失敗時はcacheを消去して次のintervalで再試行します。即時retryはしません。
+- quotaは外部APIへのopt-in照会で、monitor DBやexportには保存しません。認証・送信データの範囲は[アーキテクチャ](architecture.md)を参照してください。
+
+## sidebarと動作環境
+
+- metadata送信とherdrの実画面表示は別の確認事項です。metadataが届くことは、pixel上の描画やlayoutが正しい証拠にはなりません。
+- profile構成、Linux、未確認version、30 Pane同時稼働の実機負荷は網羅していません。
+- 実機Hermes DBはHermes自身が更新し得るため、ファイル全体のhash不変は保証できません。読み取り専用性はfixture DBで検証します。
+
+したがって、history/exportを請求額の確定や完全なTask別使用量として扱わず、baseline、mapping status、集計注記も確認してください。
