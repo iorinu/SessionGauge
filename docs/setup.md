@@ -52,12 +52,14 @@ agent_resume_bin = "/path/to/agent-resume/target/release/agent-resume"
 hermes_home = "~/.hermes"
 hermes_root = "~/.hermes/hermes-agent"
 poll_interval_seconds = 60
+mode = "estimate"
+estimate_max_age_seconds = 86400
 # 既定配置から検出できないときだけ指定する
 # hermes_python = "/path/to/hermes-agent/venv/bin/python"
 # auth_helper = "/path/to/agent-resume/adapters/hermes_bridge.py"
 ```
 
-割合のみの表示が既定です。`display = "percent_tokens"` にするとquota割合とtoken数を併記します。`ttl_ms` の既定値は15000です。quotaのpoll間隔は既定60秒、設定範囲30〜3600秒です。SDK Pythonは `hermes_root/venv/bin/python`、認証helperはagent-resume配置から検出します。検出できない場合のみ任意のパスを指定してください。
+`display = "percent_tokens"` にするとquota割合とtoken数を併記します。`ttl_ms` の既定値は15000です。modeは `estimate` が既定で、推定誤差を含む近似を `~12.3%` と表示します。校正できない間は `N/A` です。従来のAPI実測表示には `mode = "api"` を指定します。保持期限と初期サンプルの最大年齢は `estimate_max_age_seconds`（既定86400秒）で変更できます。poll間隔は既定60秒、設定範囲30〜3600秒です。SDK Pythonは `hermes_root/venv/bin/python`、認証helperはagent-resume配置から既定検出します。検出できない場合だけ任意のパスを指定してください。API response待ちの間も、既存校正とローカルtoken増分が有効なら推定を更新します。
 
 herdr設定の `[ui.sidebar.agents.rows_by_agent]` では、既定の先頭行を保ち、専用tokenを別行に追加できます。agent名はherdrが提供するため、metadataに重ねて含めない例です。
 
