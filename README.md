@@ -31,7 +31,7 @@ exportは既存ファイルを上書きしません。確認のうえ上書き�
 
 ## サイドバーとプライバシー
 
-herdrサイドバー報告とセッション別quota表示は、設定で個別に明示した場合だけ有効になります。quotaは既定で比例推定し、`~` が付いた値は推定値です。推定の校正にも使うquota有効時は、Hermes SDKの通常認証経路でOpenAIの許可済みHTTPS endpointへ照会します。通常の収集はローカルで行います。通信の詳細は[アーキテクチャ](docs/architecture.md)を参照してください。`mode = "api"` で従来の実測表示へ戻せます。`display = "percent_tokens"` にするとtoken数も併記します。設定方法は[セットアップ](docs/setup.md)を参照してください。
+herdrサイドバー報告とセッション別quota表示は、設定で個別に明示した場合だけ有効になります。`estimate` modeは精度契約を検証できないため停止しており、`N/A` を表示します。`mode = "api"` はproviderのraw task budget参照値を `API 12%` と表示しますが、現在のquota windowの正確さを示しません。quota有効時はHermes SDKの通常認証経路でOpenAIの許可済みHTTPS endpointへ照会します。通常の収集はローカルで行います。通信の詳細は[アーキテクチャ](docs/architecture.md)を参照してください。`display = "percent_tokens"` にするとローカルtoken数も併記します。設定方法は[セットアップ](docs/setup.md)を参照してください。
 
 HermesのSQLite DBは読み取り専用で開き、会話本文は取得しません。サイドバー設定は自動変更しません。
 

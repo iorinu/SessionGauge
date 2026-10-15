@@ -160,7 +160,7 @@ def test_old_model_generation_is_rejected_after_model_returns():
     reporter.close()
 
 
-def test_same_sample_batch_calibrates_each_sid_and_tracks_token_increases():
+def test_same_sample_batch_and_token_increases_remain_unavailable():
     reporter, profile, _, _, _, adapter, runner = lifecycle_harness()
     adapter.panes = [
         make_pane("model-a", pane_id="pane-a", terminal_id="terminal-a", sid="session-a"),
@@ -192,12 +192,12 @@ def test_same_sample_batch_calibrates_each_sid_and_tracks_token_increases():
         }
     )
     reporter.publish(data(1000, 1000))
-    assert displayed(runner, "pane-a") == "~15%"
-    assert displayed(runner, "pane-b") == "~30%"
+    assert displayed(runner, "pane-a") == "N/A"
+    assert displayed(runner, "pane-b") == "N/A"
 
     reporter.publish(data(1200, 1100))
-    assert displayed(runner, "pane-a") == "~18%"
-    assert displayed(runner, "pane-b") == "~33%"
+    assert displayed(runner, "pane-a") == "N/A"
+    assert displayed(runner, "pane-b") == "N/A"
     reporter.close()
 
 
@@ -223,13 +223,13 @@ def test_pending_estimate_is_not_resubmitted_and_poll_boundary_is_exact():
     reporter.close()
 
 
-def test_counter_reset_invalidates_estimate_even_when_tokens_remain_above_base():
+def test_counter_reset_never_enables_estimate():
     reporter, profile, _, _, _, adapter, runner = lifecycle_harness()
     adapter.panes = [make_pane("model-a")]
     reporter.publish(make_data(profile, "model-a", tokens=1000))
     reporter._quota_future.complete({"session-a": {"percent": 10, "data_as_of": 100}})
     reporter.publish(make_data(profile, "model-a", tokens=1500))
-    assert displayed(runner) == "~15%"
+    assert displayed(runner) == "N/A"
 
     reporter.publish(make_data(profile, "model-a", tokens=1400))
     assert displayed(runner) == "N/A"
@@ -285,7 +285,7 @@ def test_disappearance_rejects_old_result_without_invalidating_other_pane():
     )
     reporter.publish(data)
     assert displayed(runner, "pane-a") == "N/A"
-    assert displayed(runner, "pane-b") == "~20%"
+    assert displayed(runner, "pane-b") == "N/A"
     reporter.close()
 
 
@@ -308,18 +308,18 @@ def test_close_clears_owned_value_once_and_completed_job_cannot_publish():
     )
 
 
-def test_invalid_token_observed_by_estimator_does_not_restore_calibration():
+def test_invalid_token_and_new_sample_cannot_authorize_estimate():
     from sessiongauge.quota import TokenQuotaEstimator
 
     estimator = TokenQuotaEstimator(max_age_seconds=30, clock=lambda: 0, wall_clock=lambda: 100)
     scope = {"profile_id": "p", "session_id": "s", "model": "m"}
-    assert estimator.calibrate(**scope, total_tokens=1000, percent=10, data_as_of=100)
+    assert not estimator.calibrate(**scope, total_tokens=1000, percent=10, data_as_of=100)
     assert estimator.estimate(**scope, total_tokens=0) is None
     assert estimator.estimate(**scope, total_tokens=1600) is None
     assert not estimator.calibrate(**scope, total_tokens=1600, percent=15, data_as_of=100)
 
 
-def test_new_reporter_starts_without_in_memory_estimate():
+def test_new_reporter_starts_and_remains_without_estimate():
     reporter, profile, _, _, _, adapter, runner = lifecycle_harness()
     adapter.panes = [make_pane("model-a")]
     reporter.publish(make_data(profile, "model-a"))

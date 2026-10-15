@@ -69,6 +69,91 @@ def test_disabled_makes_no_commands():
     assert runner.commands == []
 
 
+def test_quota_accuracy_warning_is_once_and_only_when_estimate_quota_is_used():
+    from test_estimate_lifecycle import ManualExecutor
+
+    home = Path("~/.hermes").expanduser()
+    profile = str(uuid.uuid5(uuid.NAMESPACE_URL, str((home / "state.db").resolve())))
+    warnings = []
+
+    class Quota:
+        calls = 0
+
+        def read_session_metadata(self, threads):
+            self.calls += 1
+            return {}
+
+    quota = Quota()
+    reporter = SidebarReporter(
+        enabled=True,
+        quota_enabled=True,
+        quota_mode="estimate",
+        quota_reader=quota,
+        runner=Runner(),
+        adapter=Adapter(),
+        warning=warnings.append,
+    )
+    reporter._quota_executor.shutdown()
+    reporter._quota_executor = ManualExecutor()
+    row = {
+        "pane_id": "p1",
+        "terminal_id": "t1",
+        "status": "matched",
+        "profile": profile,
+        "session": {"id": "s", "total_tokens": 100, "model": "m"},
+    }
+    try:
+        reporter.publish({"panes": [row]})
+        reporter.publish({"panes": [row]})
+        assert len(reporter._quota_executor.jobs) == 1
+        reporter._quota_executor.jobs[0].complete()
+        reporter.publish({"panes": [row]})
+        assert len(warnings) == 1
+        assert "accounting window, denominator, and token weighting are unknown" in warnings[0]
+        assert "percent_tokens" in warnings[0] and "raw task budget" in warnings[0]
+        assert quota.calls == 1
+    finally:
+        reporter.close()
+
+
+@pytest.mark.parametrize("enabled,quota_enabled", [(False, True), (True, False)])
+def test_disabled_quota_or_reporting_has_no_accuracy_diagnostic_or_request(enabled, quota_enabled):
+    warnings = []
+
+    class Quota:
+        def read_session_metadata(self, threads):
+            raise AssertionError("disabled quota must not make a request")
+
+    reporter = SidebarReporter(
+        enabled=enabled,
+        quota_enabled=quota_enabled,
+        quota_mode="estimate",
+        quota_reader=Quota(),
+        runner=Runner(),
+        adapter=Adapter(),
+        warning=warnings.append,
+    )
+    try:
+        home = Path("~/.hermes").expanduser()
+        profile = str(uuid.uuid5(uuid.NAMESPACE_URL, str((home / "state.db").resolve())))
+        reporter.publish(
+            {
+                "panes": [
+                    {
+                        "pane_id": "p1",
+                        "terminal_id": "t1",
+                        "status": "matched",
+                        "profile": profile,
+                        "session": {"id": "s", "total_tokens": 100, "model": "m"},
+                    }
+                ]
+            }
+        )
+        assert warnings == []
+    finally:
+        reporter.close()
+
+
 def test_reports_only_matched_unique_session_and_clears_owned_token():
     runner = Runner()
     reporter = SidebarReporter(
@@ -254,7 +339,7 @@ def test_quota_is_only_added_to_unique_matching_target_profile():
         if "--token" in command
     }
     assert writes == {
-        "p1": "sessiongauge_usage=5h 57% · 42",
+        "p1": "sessiongauge_usage=API 57% · 42",
         "p2": "sessiongauge_usage=8",
     }
     assert quota.calls == 1
@@ -332,7 +417,7 @@ def test_quota_failure_keeps_numeric_metadata_and_adds_na():
         }
     )
     write = next(command for command in runner.commands if "--token" in command)
-    assert write[write.index("--token") + 1] == "sessiongauge_usage=5h N/A · 1.45M"
+    assert write[write.index("--token") + 1] == "sessiongauge_usage=API N/A · 1.45M"
 
 
 @pytest.mark.parametrize(
@@ -388,7 +473,7 @@ def test_sidebar_compacts_token_metadata_only_for_target_quota_profile(count, ex
     reporter.publish(data)
 
     write = next(command for command in runner.commands if "--token" in command)
-    assert write[write.index("--token") + 1] == f"sessiongauge_usage=5h 0% · {expected}"
+    assert write[write.index("--token") + 1] == f"sessiongauge_usage=API 0% · {expected}"
     assert data["panes"][0]["session"]["total_tokens"] == count
     assert quota.calls == 1
 
@@ -430,11 +515,11 @@ def test_sidebar_compacts_large_count_with_quota_and_preserves_herdr_prefix():
 
     write = next(command for command in runner.commands if "--token" in command)
     metadata = write[write.index("--token") + 1]
-    assert metadata == "sessiongauge_usage=5h 0% · 1.45M"
+    assert metadata == "sessiongauge_usage=API 0% · 1.45M"
     assert quota.calls == 1
     assert data["panes"][0]["session"]["total_tokens"] == 1450298
     display = "hermes · " + metadata.removeprefix("sessiongauge_usage=")
-    assert display.startswith("hermes · 5h")
+    assert display.startswith("hermes · API")
     assert len(display) <= 24
 
 
@@ -621,8 +706,8 @@ def test_native_session_percentages_are_bound_to_session_ids():
         if "--token" in command
     }
     assert writes == {
-        "p1": "sessiongauge_usage=5h 113.58% · 1.45M",
-        "p2": "sessiongauge_usage=5h 1.08% · 42",
+        "p1": "sessiongauge_usage=API 113.58% · 1.45M",
+        "p2": "sessiongauge_usage=API 1.08% · 42",
     }
     assert quota.requests == [
         [
@@ -690,8 +775,8 @@ def test_native_session_percentage_missing_for_one_session_is_na_not_shared():
         if "--token" in command
     }
     assert writes == {
-        "p1": "sessiongauge_usage=5h 113.58% · 1.45M",
-        "p2": "sessiongauge_usage=5h N/A · 42",
+        "p1": "sessiongauge_usage=API 113.58% · 1.45M",
+        "p2": "sessiongauge_usage=API N/A · 42",
     }
 
 
@@ -740,7 +825,7 @@ def test_quota_never_splits_cached_request_into_unpollable_batches(count, expect
     assert all(size <= 100 for size in quota.sizes)
     if count == 101:
         writes = [command for command in runner.commands if "--token" in command]
-        assert all("5h N/A" in command[command.index("--token") + 1] for command in writes)
+        assert all("API N/A" in command[command.index("--token") + 1] for command in writes)
 
 
 def test_cli_factory_uses_hermes_root_for_default_python(monkeypatch, tmp_path):
@@ -782,9 +867,9 @@ def test_cli_factory_uses_hermes_root_for_default_python(monkeypatch, tmp_path):
 @pytest.mark.parametrize(
     ("quota_value", "expected"),
     [
-        (113.58442524, "113.58%"),
-        (0, "0%"),
-        (1.08, "1.08%"),
+        (113.58442524, "API 113.58%"),
+        (0, "API 0%"),
+        (1.08, "API 1.08%"),
         (None, "N/A"),
     ],
 )
@@ -855,7 +940,45 @@ def test_default_percent_only_is_na_without_eligible_quota(quota_enabled, profil
     assert write[write.index("--token") + 1] == "sessiongauge_usage=N/A"
 
 
-def test_estimate_mode_formats_estimated_percent_without_window_claim():
+@pytest.mark.parametrize("value", [True, -1, float("nan"), float("inf"), 10**400])
+def test_api_raw_reference_rejects_boolean_negative_and_nonfinite_values(value):
+    home = Path("~/.hermes").expanduser()
+    profile = str(uuid.uuid5(uuid.NAMESPACE_URL, str((home / "state.db").resolve())))
+
+    class Quota:
+        def read_sessions(self, threads):
+            return {"s": value}
+
+    runner = Runner()
+    reporter = SidebarReporter(
+        enabled=True,
+        quota_enabled=True,
+        quota_reader=Quota(),
+        runner=runner,
+        adapter=Adapter(),
+        display="percent_tokens",
+    )
+    try:
+        reporter.publish(
+            {
+                "panes": [
+                    {
+                        "pane_id": "p1",
+                        "terminal_id": "t1",
+                        "status": "matched",
+                        "profile": profile,
+                        "session": {"id": "s", "total_tokens": 1000},
+                    }
+                ]
+            }
+        )
+        write = next(command for command in runner.commands if "--token" in command)
+        assert write[write.index("--token") + 1] == "sessiongauge_usage=API N/A · 1K"
+    finally:
+        reporter.close()
+
+
+def test_estimate_mode_remains_na_even_with_fresh_calibration_sample():
     from concurrent.futures import Future
 
     home = Path("~/.hermes").expanduser()
@@ -893,5 +1016,5 @@ def test_estimate_mode_formats_estimated_percent_without_window_claim():
     }
     reporter.publish(data)
     write = next(command for command in runner.commands if "--token" in command)
-    assert write[write.index("--token") + 1] == "sessiongauge_usage=~15%"
+    assert write[write.index("--token") + 1] == "sessiongauge_usage=N/A"
     reporter.close()

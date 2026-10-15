@@ -21,7 +21,7 @@ flowchart LR
     X -->|httpx POST; allowlisted HTTPS query_v2| API[OpenAI thread usage API]
     API -->|response| X
     X -->|allowlisted percentage + top-level data_as_of| Q
-    Q -->|asynchronous per-scope calibration| S
+    Q -. calibration rejected; estimate unavailable .-> S
     S --> F[Sidebar display formatter]
     Q --> F
     F -->|sessiongauge_usage metadata| O[herdr metadata output]
@@ -57,7 +57,7 @@ startup hookはHerdr SERVERの起動・handoff時だけで、client attach/detac
 
 サイドバー報告には `[sidebar] enabled = true` が必要で、quota照会は独立して `[sidebar.quota] enabled = true` も必要です。`Collector` から `SidebarReporter`、formatterを経てherdrへmetadataを送ります。quotaが有効で対象が適格な場合だけ、`SidebarReporter` が `QuotaReader` を呼び、Hermes SDK用Pythonでbundled `hermes_usage_bridge.py` を起動します。bridgeは既存helperを通じてHermes SDKのcredential resolverとURL resolverを利用します。`hermes_root` はSDKのコード配置、`hermes_home` はSDKが使うprofile/home、`hermes_python` はそのSDK環境のPythonを指し、それぞれ別の設定です。
 
-bridgeはhttpxで `thread_usage/query_v2` へのHTTPS POSTを行い、`chatgpt.com` と `api.openai.com` の許可済みhostに限定します。認証はAuthorizationヘッダーで行い、利用可能な場合はChatGPT-Account-Idヘッダーも送ります。本文にはSID（thread ID）、開始時刻、空のdescendant ID一覧だけを含みます。会話本文・タイトル・cwd、他のraw response情報は表示・永続化しません。metadata modeだけでトップレベルの `data_as_of` と要求SIDごとの `five_hour_limit_percent` をallowlistし、profile・SID・model別の校正としてプロセスメモリに保持します。API取得は非同期で、表示は有効な校正点とローカルtoken増分から推定します。
+bridgeはhttpxで `thread_usage/query_v2` へのHTTPS POSTを行い、`chatgpt.com` と `api.openai.com` の許可済みhostに限定します。認証はAuthorizationヘッダーで行い、利用可能な場合はChatGPT-Account-Idヘッダーも送ります。本文にはSID（thread ID）、開始時刻、空のdescendant ID一覧だけを含みます。会話本文・タイトル・cwd、他のraw response情報は表示・永続化しません。metadata modeだけでトップレベルの `data_as_of` と要求SIDごとの `five_hour_limit_percent` をallowlistします。API照会は同期です。非同期なのはestimate metadataの読み取りであり、得られた校正sampleは精度契約がないため拒否し、`estimate` 表示はN/Aです。
 
 通常の収集に新たな依存はなく、quota bridgeはHermes SDK環境にすでにあるSDKとhttpxを利用します。quota経路は外部通信を行うため、通常のローカル収集とは異なるopt-inの境界です。
 
@@ -65,7 +65,7 @@ bridgeの監査ガードは `.env` / `.env.*` と `.ssh` へのopenを拒否し�
 
 ## サイドバー報告
 
-sidebar reporterはPaneの現在状態とSession IDを再確認し、一意に対応するPaneだけにnamespaced `sessiongauge_usage` tokenをTTL付きmetadataとして送信します。終了時や対象消失時にSessionGaugeが所有するtokenをclearします。既定の表示形式は割合のみで、`percent_tokens` は任意の併記形式です。herdr側の行設定は利用者が行います。
+sidebar reporterはPaneの現在状態とSession IDを再確認し、一意に対応するPaneだけにnamespaced `sessiongauge_usage` tokenをTTL付きmetadataとして送信します。終了時や対象消失時にSessionGaugeが所有するtokenをclearします。`estimate` modeは精度契約が不明なため常にN/Aです。`api` modeはprovider raw task budgetを `API` ラベル付きで表示し、現在window精度を示しません。`percent_tokens` はローカルtoken数を任意で併記します。herdr側の行設定は利用者が行います。
 
 ## 集計上の扱い
 

@@ -1,6 +1,7 @@
 """herdr sidebar metadata reporter; metadataは明示的に有効化された場合だけ送る。"""
 
 import json
+import math
 import subprocess
 import sys
 import time
@@ -83,6 +84,7 @@ class SidebarReporter:
         self.warning = warning or (lambda message: print(f"Warning: {message}", file=sys.stderr))
         self._capability = None
         self._unsupported_warned = False
+        self._quota_accuracy_warned = False
         self._owned = {}
         self._last_seq = 0
         self._counter = 0
@@ -281,6 +283,12 @@ class SidebarReporter:
                 )
         if self.quota_mode == "estimate":
             self._sync_estimate_scopes(desired_scopes)
+            if self.quota_enabled and quota_targets and not self._quota_accuracy_warned:
+                self.warning(
+                    f"{self.estimator.unavailable_reason}; estimate mode remains N/A. "
+                    "percent_tokens shows local counts; api mode shows the provider's raw task budget, not current-window accuracy."
+                )
+                self._quota_accuracy_warned = True
         if self.quota_enabled and quota_targets:
             threads = []
             for key in sorted(quota_targets, key=lambda item: str(item)):
@@ -347,23 +355,17 @@ class SidebarReporter:
             if self.display == "percent":
                 value = quota.get(sid) if key in quota_targets else None
                 token = (
-                    f"{value:.2f}".rstrip("0").rstrip(".") + "%"
-                    if isinstance(value, (int, float)) and not isinstance(value, bool)
+                    "API " + f"{value:.2f}".rstrip("0").rstrip(".") + "%"
+                    if self._valid_display_percent(value)
                     else "N/A"
                 )
-                if self.quota_mode == "estimate" and value is not None:
-                    token = "~" + token
             elif key in quota_targets:
                 value = quota.get(sid)
-                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                if self.quota_mode == "api" and self._valid_display_percent(value):
                     percent = f"{value:.2f}".rstrip("0").rstrip(".")
-                    token = (
-                        f"~{percent}% · {token}"
-                        if self.quota_mode == "estimate"
-                        else f"5h {percent}% · {token}"
-                    )
+                    token = f"API {percent}% · {token}"
                 else:
-                    token = f"{'N/A' if self.quota_mode == 'estimate' else '5h N/A'} · {token}"
+                    token = f"{'N/A' if self.quota_mode == 'estimate' else 'API N/A'} · {token}"
             if self._send(key[1], token=token):
                 self._owned[key] = sid
 
@@ -371,6 +373,15 @@ class SidebarReporter:
         for key in list(self._owned):
             self._send(key[1], clear=True)
             self._owned.pop(key, None)
+
+    @staticmethod
+    def _valid_display_percent(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            return False
+        try:
+            return math.isfinite(float(value))
+        except (OverflowError, ValueError):
+            return False
 
     def _sync_estimate_scopes(self, desired):
         """各paneの有効scopeを更新し、変化した世代の校正を破棄する。"""

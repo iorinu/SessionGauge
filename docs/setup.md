@@ -95,7 +95,7 @@ estimate_max_age_seconds = 86400
 # auth_helper = "/path/to/agent-resume/adapters/hermes_bridge.py"
 ```
 
-`display = "percent_tokens"` にするとquota割合とtoken数を併記します。`ttl_ms` の既定値は15000です。modeは `estimate` が既定で、推定誤差を含む近似を `~12.3%` と表示します。校正できない間は `N/A` です。従来のAPI実測表示には `mode = "api"` を指定します。保持期限と初期サンプルの最大年齢は `estimate_max_age_seconds`（既定86400秒）で変更できます。poll間隔は既定60秒、設定範囲30〜3600秒です。SDK Pythonは `hermes_root/venv/bin/python`、認証helperはagent-resume配置から既定検出します。検出できない場合だけ任意のパスを指定してください。API response待ちの間も、既存校正とローカルtoken増分が有効なら推定を更新します。
+`display = "percent_tokens"` にすると表示値とローカルtoken数を併記します。`ttl_ms` の既定値は15000です。modeは `estimate` が既定ですが、accounting window・分母・token重み付けを検証できないため常に `N/A` です。`mode = "api"` はproviderのraw task budget参照を `API 12%` と表示し、現在windowの正確なquota率とはみなしません。`estimate_max_age_seconds` は互換性のため設定可能ですが、推定を有効化しません。poll間隔は既定60秒、設定範囲30〜3600秒です。SDK Pythonは `hermes_root/venv/bin/python`、認証helperはagent-resume配置から既定検出します。検出できない場合だけ任意のパスを指定してください。
 
 herdr設定の `[ui.sidebar.agents.rows_by_agent]` では、既定の先頭行を保ち、専用tokenを別行に追加できます。agent名はherdrが提供するため、metadataに重ねて含めない例です。
 
@@ -122,7 +122,7 @@ Ctrl-CでSessionGaugeを終了します。終了時にSessionGauge自身のsideb
 
 ## quota照会とプライバシー
 
-quota機能はSIDごとにCodex nativeの `five_hour_limit_percent` を取得します。Hermes SDKの通常のcredential resolverと既存agent-resume helperを使い、`https://chatgpt.com` または `https://api.openai.com` の許可済みhostにある `thread_usage/query_v2` だけへ読み取り専用POSTを送ります。認証情報はAuthorizationヘッダーに使われ、利用可能な場合はChatGPT-Account-Idもヘッダーに含まれます。本文は対象thread ID、開始時刻、空のdescendant一覧です。会話本文、タイトル、cwdは送りません。credential storeをSessionGaugeが直接解析・保存せず、raw responseやcredentialをログ・永続化しません。
+quota機能はSIDごとにCodex nativeの `five_hour_limit_percent` を取得します。`api` modeで表示する値はproviderのraw task budget参照であり、現在windowのsession quota精度を保証しません。API応答にはwindow境界・分母・ローカルtokenとの対応がありません。Hermes SDKの通常のcredential resolverと既存agent-resume helperを使い、`https://chatgpt.com` または `https://api.openai.com` の許可済みhostにある `thread_usage/query_v2` だけへ読み取り専用POSTを送ります。認証情報はAuthorizationヘッダーに使われ、利用可能な場合はChatGPT-Account-Idもヘッダーに含まれます。本文は対象thread ID、開始時刻、空のdescendant一覧です。会話本文、タイトル、cwdは送りません。credential storeをSessionGaugeが直接解析・保存せず、raw responseやcredentialをログ・永続化しません。
 
 このopt-in機能は外部ネットワークを使います。通常のローカル収集はネットワーク送信をしません。quota値はmonitor DBやexportへ保存しません。詳細な制約は[既知の制限](known-limitations.md)を参照してください。
 

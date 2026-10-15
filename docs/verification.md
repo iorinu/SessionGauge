@@ -50,6 +50,12 @@ pytestはfixture・unit testで、実API呼び出しを行いません。受け�
 
 SDK/APIのfixture testはmock/fixtureであり、実環境でのAPI照会と同一ではありません。設定確認やherdr readbackなどのad-hoc確認もpytest件数に含めません。
 
+## Issue #2の回帰試験と精度上の限界
+
+`tests/test_quota_accuracy.py::test_delayed_historical_percent_is_not_scaled_by_request_time_tokens` は遅延した履歴値と時刻差のあるローカルcounterでも `N/A` となることを検証します。関連するfixture/unit testsはsample校正拒否、model/cacheやreset/restart等の条件が精度を証明しないこと、SID単位のAPI raw reference表示、警告のopt-in/一度限りを検証します。これらはデータ処理のfail-closed/reference handlingを示すもので、実APIの正確さを示しません。
+
+accounting window、denominator、counter alignment、token weightingの精度契約と、同一account/SID/periodで独立検証可能な参照値は **BLOCKED** です。この回帰試験で実APIまたはlive monitorは実行していません。
+
 ## 未確認事項
 
 - 実画面のpixel描画とlayout、live metadata clear。

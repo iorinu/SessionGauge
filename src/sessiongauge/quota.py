@@ -10,7 +10,9 @@ from pathlib import Path
 
 
 class TokenQuotaEstimator:
-    """プロセス内だけで保持する単一点比例推定器。"""
+    """検証可能な同一window契約がないため、quota推定を停止する。"""
+
+    unavailable_reason = "quota accuracy unavailable: accounting window, denominator, and token weighting are unknown"
 
     def __init__(self, max_age_seconds=86400, clock=None, wall_clock=None):
         if type(max_age_seconds) is not int or max_age_seconds <= 0:
@@ -33,36 +35,8 @@ class TokenQuotaEstimator:
         )
 
     def calibrate(self, *, profile_id, session_id, model, total_tokens, percent, data_as_of):
-        if not self._valid_scope(profile_id, session_id, model) or not self._valid_tokens(
-            total_tokens
-        ):
-            return False
-        if isinstance(percent, bool) or not isinstance(percent, (int, float)):
-            return False
-        try:
-            percent = float(percent)
-        except (OverflowError, ValueError):
-            return False
-        if not math.isfinite(percent) or percent <= 0:
-            return False
-        if isinstance(data_as_of, bool) or not isinstance(data_as_of, (int, float)):
-            return False
-        try:
-            as_of = float(data_as_of)
-        except (OverflowError, ValueError):
-            return False
-        if not math.isfinite(as_of):
-            return False
-        age = self.wall_clock() - as_of
-        if age < 0 or age > self.max_age_seconds:
-            return False
-        key = (profile_id, session_id, model)
-        if self._last_as_of.get(key) is not None and as_of <= self._last_as_of[key]:
-            return False
-        self._last_as_of[key] = as_of
-        self._calibrations[key] = (total_tokens, percent, self.clock())
-        self._last_tokens[key] = total_tokens
-        return True
+        # data_as_ofとtoken累計の対応だけではaccounting window/分母/重み付けを証明できない。
+        return False
 
     def invalidate(self, *, profile_id, session_id, model):
         """校正とcounter追跡だけを破棄し、古いsample watermarkは保持する。"""
@@ -71,30 +45,7 @@ class TokenQuotaEstimator:
         self._last_tokens.pop(key, None)
 
     def estimate(self, *, profile_id, session_id, model, total_tokens):
-        if not self._valid_scope(profile_id, session_id, model):
-            return None
-        key = (profile_id, session_id, model)
-        if not self._valid_tokens(total_tokens):
-            self.invalidate(profile_id=profile_id, session_id=session_id, model=model)
-            return None
-        previous = self._last_tokens.get(key)
-        self._last_tokens[key] = total_tokens
-        calibration = self._calibrations.get(key)
-        if previous is not None and total_tokens < previous:
-            self._calibrations.pop(key, None)
-            return None
-        if calibration is None:
-            return None
-        base_tokens, percent, accepted = calibration
-        if self.clock() - accepted >= self.max_age_seconds or total_tokens < base_tokens:
-            self._calibrations.pop(key, None)
-            return None
-        try:
-            result = percent * (total_tokens / base_tokens)
-        except (OverflowError, ZeroDivisionError):
-            self._calibrations.pop(key, None)
-            return None
-        return result if math.isfinite(result) else None
+        return None
 
 
 class QuotaReader:

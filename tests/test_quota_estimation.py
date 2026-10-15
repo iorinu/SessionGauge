@@ -1,7 +1,7 @@
 import pytest
 
 
-def test_estimates_percentage_from_token_increase_within_same_scope():
+def test_calibration_samples_are_rejected_when_quota_accounting_scope_is_unknown():
     from sessiongauge import quota
 
     monotonic_time = [0]
@@ -10,8 +10,11 @@ def test_estimates_percentage_from_token_increase_within_same_scope():
         clock=lambda: monotonic_time[0],
         wall_clock=lambda: 100,
     )
+    assert estimator.unavailable_reason == (
+        "quota accuracy unavailable: accounting window, denominator, and token weighting are unknown"
+    )
 
-    assert estimator.calibrate(
+    assert not estimator.calibrate(
         profile_id="profile-a",
         session_id="session-a",
         model="model-a",
@@ -27,20 +30,20 @@ def test_estimates_percentage_from_token_increase_within_same_scope():
         total_tokens=1500,
     )
 
-    assert estimated_percent == pytest.approx(15)
+    assert estimated_percent is None
 
 
-def test_estimator_recalibrates_only_on_newer_sample_and_expires():
+def test_estimator_remains_unavailable_after_recalibration_or_expiry():
     from sessiongauge.quota import TokenQuotaEstimator
 
     now = [0]
     estimator = TokenQuotaEstimator(max_age_seconds=10, clock=lambda: now[0], wall_clock=lambda: 20)
     scope = {"profile_id": "p", "session_id": "s", "model": "m"}
-    assert estimator.calibrate(**scope, total_tokens=100, percent=10, data_as_of=10)
+    assert not estimator.calibrate(**scope, total_tokens=100, percent=10, data_as_of=10)
     assert not estimator.calibrate(**scope, total_tokens=200, percent=90, data_as_of=10)
-    assert estimator.estimate(**scope, total_tokens=200) == pytest.approx(20)
-    assert estimator.calibrate(**scope, total_tokens=200, percent=15, data_as_of=11)
-    assert estimator.estimate(**scope, total_tokens=300) == pytest.approx(22.5)
+    assert estimator.estimate(**scope, total_tokens=200) is None
+    assert not estimator.calibrate(**scope, total_tokens=200, percent=15, data_as_of=11)
+    assert estimator.estimate(**scope, total_tokens=300) is None
     assert not estimator.calibrate(**scope, total_tokens=300, percent=5, data_as_of=9)
     now[0] = 10
     assert estimator.estimate(**scope, total_tokens=300) is None
@@ -76,21 +79,54 @@ def test_estimator_rejects_invalid_calibration_percentages(percent):
     )
 
 
-def test_estimator_does_not_clamp_above_100_and_invalidates_counter_reset():
+@pytest.mark.parametrize("data_as_of", [None, -10, 2, float("nan"), float("inf")])
+def test_estimator_rejects_missing_stale_future_or_nonfinite_data_as_of(data_as_of):
+    from sessiongauge.quota import TokenQuotaEstimator
+
+    estimator = TokenQuotaEstimator(max_age_seconds=10, wall_clock=lambda: 1)
+    assert not estimator.calibrate(
+        profile_id="p",
+        session_id="s",
+        model="m",
+        total_tokens=100,
+        percent=10,
+        data_as_of=data_as_of,
+    )
+
+
+def test_estimator_rejects_model_changes_within_a_scope():
+    from sessiongauge.quota import TokenQuotaEstimator
+
+    estimator = TokenQuotaEstimator(wall_clock=lambda: 1)
+    assert not estimator.calibrate(
+        profile_id="p",
+        session_id="s",
+        model="model-a",
+        total_tokens=100,
+        percent=10,
+        data_as_of=1,
+    )
+    assert (
+        estimator.estimate(profile_id="p", session_id="s", model="model-b", total_tokens=200)
+        is None
+    )
+
+
+def test_estimator_rejects_valid_sample_and_counter_reset_without_scaling():
     from sessiongauge.quota import TokenQuotaEstimator
 
     estimator = TokenQuotaEstimator(wall_clock=lambda: 1)
     scope = {"profile_id": "p", "session_id": "s", "model": "m"}
-    assert estimator.calibrate(**scope, total_tokens=100, percent=90, data_as_of=1)
-    assert estimator.estimate(**scope, total_tokens=120) == pytest.approx(108)
+    assert not estimator.calibrate(**scope, total_tokens=100, percent=90, data_as_of=1)
+    assert estimator.estimate(**scope, total_tokens=120) is None
     assert estimator.estimate(**scope, total_tokens=99) is None
 
 
-def test_estimator_scope_changes_do_not_reuse_calibration():
+def test_estimator_returns_none_for_unseen_profile_and_model_scopes():
     from sessiongauge.quota import TokenQuotaEstimator
 
     estimator = TokenQuotaEstimator(wall_clock=lambda: 1)
-    assert estimator.calibrate(
+    assert not estimator.calibrate(
         profile_id="p",
         session_id="s",
         model="m",
