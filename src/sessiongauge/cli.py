@@ -4,6 +4,7 @@ import json
 import os
 import platform
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -14,9 +15,20 @@ from pathlib import Path
 from sessiongauge import __version__
 from sessiongauge.adapters.herdr import HerdrAdapter
 from sessiongauge.adapters.hermes_db import SAFE_COLUMNS, HermesDB
+from sessiongauge.autostart import AutostartError
 from sessiongauge.collector import Collector
 from sessiongauge.config import load_config, profile_name_for_path
+from sessiongauge.monitor_lock import (
+    MonitorAlreadyRunning,
+    MonitorEndpointError,
+    MonitorLease,
+    resolve_endpoint,
+)
 from sessiongauge.persistence import MonitorDB
+
+MONITOR_ALREADY_RUNNING_MESSAGE = (
+    "SessionGauge monitor is already running for this data directory and herdr endpoint."
+)
 
 
 def _parser():
@@ -24,7 +36,9 @@ def _parser():
     parser.add_argument("--config")
     parser.add_argument("--hermes-db", action="append")
     parser.add_argument("--data-dir")
-    parser.add_argument("--poll-interval-seconds", type=int)
+    parser.add_argument(
+        "--poll-interval-seconds", "--interval", dest="poll_interval_seconds", type=int
+    )
     parser.add_argument("--time-zone")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--debug", action="store_true")
@@ -34,7 +48,13 @@ def _parser():
         command.add_argument("--config", default=argparse.SUPPRESS)
         command.add_argument("--data-dir", default=argparse.SUPPRESS)
         command.add_argument("--hermes-db", action="append", default=argparse.SUPPRESS)
-        command.add_argument("--poll-interval-seconds", type=int, default=argparse.SUPPRESS)
+        command.add_argument(
+            "--poll-interval-seconds",
+            "--interval",
+            dest="poll_interval_seconds",
+            type=int,
+            default=argparse.SUPPRESS,
+        )
         command.add_argument("--time-zone", default=argparse.SUPPRESS)
         command.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS)
         command.add_argument("--debug", action="store_true", default=argparse.SUPPRESS)
@@ -72,6 +92,14 @@ def _parser():
     show = sub.add_parser("show")
     common(show)
     show.add_argument("id")
+    autostart = sub.add_parser("autostart")
+    common(autostart)
+    actions = autostart.add_subparsers(dest="autostart_action", required=True)
+    for name in ("install", "start", "stop", "status", "uninstall", "run"):
+        action = actions.add_parser(name)
+        common(action)
+        action.add_argument("--socket-path")
+        action.add_argument("--herdr-bin")
     return parser
 
 
@@ -97,6 +125,8 @@ def main(argv=None):
         config = load_config(
             cli=cli, config_path=Path(args.config).expanduser() if args.config else None
         )
+        if args.command == "autostart":
+            return _autostart(config, args)
         if args.command == "doctor":
             return _doctor(config)
         if args.command == "live":
@@ -111,7 +141,7 @@ def main(argv=None):
                         )
                     from sessiongauge.tui import run_tui
 
-                    return run_tui(config, _sidebar_factory(config))
+                    return _continuous_tui(config, run_tui)
                 print(
                     "live requires a TTY; use --once for a text snapshot or --json for JSON output",
                     file=sys.stderr,
@@ -129,6 +159,15 @@ def main(argv=None):
     except KeyboardInterrupt:
         print("Interrupted", file=sys.stderr)
         return 130
+    except AutostartError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except MonitorAlreadyRunning:
+        print(MONITOR_ALREADY_RUNNING_MESSAGE, file=sys.stderr)
+        return 0
+    except MonitorEndpointError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     except (
         ValueError,
         OSError,
@@ -296,6 +335,144 @@ def _doctor(config):
     return 0
 
 
+def _autostart(config, args):
+    from sessiongauge.autostart import Installation
+
+    if platform.system() != "Darwin":
+        raise AutostartError("autostart is only supported on macOS")
+    executable = (
+        getattr(args, "herdr_bin", None)
+        or os.environ.get("HERDR_BIN_PATH")
+        or shutil.which("herdr")
+    )
+    if not executable or not Path(executable).is_absolute():
+        raise AutostartError("herdr executable must be an absolute path")
+    endpoint = getattr(args, "socket_path", None)
+    if endpoint is None:
+        endpoint = resolve_endpoint()
+    endpoint = Path(endpoint).expanduser()
+    if not endpoint.is_absolute():
+        raise AutostartError("herdr socket path must be absolute")
+    config_path = (
+        Path(args.config).expanduser()
+        if args.config
+        else Path(
+            os.environ.get("SESSIONGAUGE_CONFIG", Path.home() / ".config/sessiongauge/config.toml")
+        ).expanduser()
+    )
+    instance = Installation(
+        data_dir=config.data_dir,
+        socket_path=endpoint,
+        config_path=config_path,
+        python_executable=sys.executable,
+        herdr_bin=executable,
+        runner=subprocess.run,
+        hermes_db_paths=(
+            tuple(Path(path).expanduser().resolve(strict=False) for path in args.hermes_db)
+            if args.hermes_db
+            else None
+        ),
+        poll_interval_seconds=args.poll_interval_seconds,
+        time_zone=args.time_zone,
+    )
+    action = args.autostart_action
+    if action == "run":
+        return _autostart_run(instance, config)
+    # plugin actionはmanifestが注入するsocketと対象を一致させてからnative処理する。
+    if os.environ.get("HERDR_ENV"):
+        injected = os.environ.get("HERDR_SOCKET_PATH")
+        if not injected or Path(injected).expanduser().resolve(strict=False) != endpoint.resolve(
+            strict=False
+        ):
+            print(json.dumps({"not_applicable": True}))
+            return 0
+    if action == "install":
+        instance.install()
+        print(
+            json.dumps(
+                {
+                    "label": instance.label,
+                    "plist_path": str(instance.plist_path),
+                    "plugin_dir": str(instance.plugin_path.parent),
+                    "plugin_path": str(instance.plugin_path),
+                    "plugin_id": instance.plugin_id,
+                    "scope_hash": instance.scope_hash,
+                }
+            )
+        )
+    elif action == "start":
+        instance.start()
+        print(json.dumps({"started": True}))
+    elif action == "stop":
+        instance.stop()
+        print(json.dumps({"stopped": True}))
+    elif action == "status":
+        print(json.dumps(instance.status()))
+    elif action == "uninstall":
+        instance.uninstall()
+        print(json.dumps({"uninstalled": True}))
+    return 0
+
+
+def _autostart_run(instance, config=None):
+    previous = {
+        key: os.environ.get(key) for key in ("HERDR_SOCKET_PATH", "HERDR_BIN_PATH", "HERDR_ENV")
+    }
+    old_handlers = {}
+    try:
+        os.environ.update(
+            {
+                "HERDR_SOCKET_PATH": str(instance.socket_path),
+                "HERDR_BIN_PATH": instance.herdr_bin,
+                "HERDR_ENV": "1",
+            }
+        )
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            old_handlers[sig] = signal.getsignal(sig)
+            signal.signal(sig, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+        try:
+            result = subprocess.run(
+                [instance.herdr_bin, "status", "--json"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return 0
+        if result.returncode != 0:
+            return 0
+        try:
+            status = json.loads(result.stdout)
+        except (ValueError, TypeError) as exc:
+            raise AutostartError("herdr status response is invalid") from exc
+        if not isinstance(status, dict) or not isinstance(status.get("server"), dict):
+            raise AutostartError("herdr status response is invalid")
+        server = status["server"]
+        if type(server.get("running")) is not bool:
+            raise AutostartError("herdr status response is invalid")
+        socket = server.get("socket", server.get("socket_path"))
+        if server["running"] is False:
+            return 0
+        if not isinstance(socket, str) or not Path(socket).is_absolute():
+            raise AutostartError("herdr status endpoint is invalid")
+        if Path(socket).resolve(strict=False) != instance.socket_path.resolve(strict=False):
+            raise AutostartError("herdr status endpoint does not match configured socket")
+        return _live(
+            config or load_config(config_path=instance.config_path), as_json=True, once=False
+        )
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        for sig, handler in old_handlers.items():
+            signal.signal(sig, handler)
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def _live(config, as_json, *, once=True, profile=None):
     if profile:
         from dataclasses import replace
@@ -303,7 +480,10 @@ def _live(config, as_json, *, once=True, profile=None):
         selected = _select_profiles(config.hermes_db_paths, profile)
         config = replace(config, hermes_db_paths=selected)
     collector = None
+    lease = _continuous_lease(config) if not once else None
     try:
+        if lease is not None:
+            lease.__enter__()
         while True:
             try:
                 if collector is None:
@@ -322,8 +502,28 @@ def _live(config, as_json, *, once=True, profile=None):
                 return 0
             time.sleep(config.poll_interval_seconds)
     finally:
-        if collector:
-            collector.close()
+        try:
+            if collector:
+                collector.close()
+        finally:
+            if lease is not None:
+                lease.__exit__(None, None, None)
+
+
+def _continuous_lease(config):
+    if os.name != "posix":
+        return None
+    config.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return MonitorLease(config.data_dir, resolve_endpoint())
+
+
+def _continuous_tui(config, run_tui):
+    factory = _sidebar_factory(config)
+    lease = _continuous_lease(config)
+    if lease is None:
+        return run_tui(config, factory)
+    lease.__enter__()
+    return run_tui(config, factory, lease=lease)
 
 
 def _sidebar_factory(config):

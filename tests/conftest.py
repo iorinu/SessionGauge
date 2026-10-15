@@ -14,3 +14,5 @@ def isolate_sessiongauge_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("SESSIONGAUGE_CONFIG", str(config_path))
     monkeypatch.setenv("SESSIONGAUGE_DATA_DIR", str(data_dir))
     monkeypatch.setenv("SESSIONGAUGE_HERMES_DB_PATHS", str(hermes_home / "state.db"))
+    monkeypatch.setenv("HERDR_SOCKET_PATH", str(tmp_path / "herdr.sock"))
+    monkeypatch.setenv("HERDR_ENV", "test")

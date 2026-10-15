@@ -362,7 +362,9 @@ def render_frame(data, state, width=80, now=None, height=None, config=None):
     return [_clip(line, width) for line in lines]
 
 
-def _worker(config, collector_factory, messages, stop, refresh, interval, profile):
+def _worker(
+    config, collector_factory, messages, stop, refresh, interval, profile, on_finished=None
+):
     collector = None
     try:
         collector = collector_factory(config)
@@ -517,11 +519,17 @@ def _worker(config, collector_factory, messages, stop, refresh, interval, profil
                 refresh.wait(interval)
                 refresh.clear()
     finally:
-        if collector is not None:
-            collector.close()
+        try:
+            if collector is not None:
+                collector.close()
+        finally:
+            if on_finished is not None:
+                on_finished()
 
 
-def run_tui(config, collector_factory, *, screen_runner=None, interval=None, profile=None):
+def run_tui(
+    config, collector_factory, *, screen_runner=None, interval=None, profile=None, lease=None
+):
     messages, stop, refresh = queue.Queue(), threading.Event(), threading.Event()
     worker = threading.Thread(
         target=_worker,
@@ -533,10 +541,16 @@ def run_tui(config, collector_factory, *, screen_runner=None, interval=None, pro
             refresh,
             interval or config.poll_interval_seconds,
             profile,
+            (lambda: lease.__exit__(None, None, None)) if lease is not None else None,
         ),
         daemon=True,
     )
-    worker.start()
+    try:
+        worker.start()
+    except BaseException:
+        if lease is not None:
+            lease.__exit__(None, None, None)
+        raise
     state, data = TUIState(), {"panes": [], "sessions": [], "status": "starting"}
 
     def ui(screen):
