@@ -25,6 +25,8 @@ uv run sessiongauge link <pane-id> <session-id>
 uv run sessiongauge show <task-id>
 ```
 
+macOSでherdr 0.9.2のserver起動に合わせてmonitorを管理する場合は、[autostart手順](docs/setup.md#herdr-autostartmacos--herdr-092)を参照してください。既定では有効になりません。
+
 exportは既存ファイルを上書きしません。確認のうえ上書きする場合は `--force` を指定します。監視開始時の累計baselineは期間内の使用量ではありません。`N/A` は未取得を示し、ゼロとは異なります。
 
 ## サイドバーとプライバシー

@@ -35,6 +35,24 @@ flowchart LR
 - 通常の収集データの永続化先は独自monitor DBです。sidebarを有効にした場合は別途herdrへmetadataを送信します。初回値はbaselineとして保存し、後続の累計値との差を観測区間のusageとして集計します。
 - messages、system prompt、tool argumentsは収集しません。通常の収集は外部通信やtelemetryを行いません。
 
+## macOS autostart
+
+```mermaid
+sequenceDiagram
+    participant H as herdr plugin startup
+    participant A as short launchctl start action
+    participant L as LaunchAgent
+    participant M as SessionGauge managed monitor
+    participant O as OS monitor lease
+    H->>A: start (one-shot)
+    A->>L: launchctl bootstrap / kickstart
+    L->>M: foreground Python process
+    M->>O: acquire data-dir + socket lease
+    M->>M: readonly herdr status check; backoff/reconnect
+```
+
+startup hookはHerdr SERVERの起動・handoff時だけで、client attach/detachではありません。server未準備ならmonitor DB/quotaを起動せずdeferし、動作中の一時切断ではmonitorがscope leaseを維持して既存Collectorのbackoffに任せます。
+
 ## 任意のquota経路
 
 サイドバー報告には `[sidebar] enabled = true` が必要で、quota照会は独立して `[sidebar.quota] enabled = true` も必要です。`Collector` から `SidebarReporter`、formatterを経てherdrへmetadataを送ります。quotaが有効で対象が適格な場合だけ、`SidebarReporter` が `QuotaReader` を呼び、Hermes SDK用Pythonでbundled `hermes_usage_bridge.py` を起動します。bridgeは既存helperを通じてHermes SDKのcredential resolverとURL resolverを利用します。`hermes_root` はSDKのコード配置、`hermes_home` はSDKが使うprofile/home、`hermes_python` はそのSDK環境のPythonを指し、それぞれ別の設定です。

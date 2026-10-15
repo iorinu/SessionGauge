@@ -22,6 +22,42 @@ uv run sessiongauge live
 
 live画面は累計、観測差分、直近60秒に終了した観測区間の差分を表示します。導入時点ですでに存在する使用量はbaselineとして別扱いで、過去の期間使用量には含めません。履歴は観測できた区間の集計です。
 
+## herdr autostart（macOS / herdr 0.9.2）
+
+安定したinstalled PythonとSessionGauge runtimeを使ってください。LaunchAgentはそのPythonを絶対pathで呼ぶため、開発用checkoutを使う場合も移動・削除しない場所に保持します。設定はopt-inのままで、既存設定を変更しません。
+
+```sh
+uv run sessiongauge --config ~/.config/sessiongauge/config.toml autostart install
+```
+
+installはLaunchAgent plistとherdr plugin manifestを生成・登録し、JSONで `plugin_dir` と `plugin_id` を返します。herdrへのplugin linkは出力を確認して明示的に行います。
+
+LaunchAgentには `load_config` が読む `HERMES_HOME` と非secretな `SESSIONGAUGE_*` 設定環境変数（DB path、data directory、poll間隔、timezone、sidebar表示設定）だけを引き継ぎます。credentialや任意の環境変数は保存しません。install時に `--hermes-db`、`--poll-interval-seconds`、`--time-zone` を明示した値はLaunchAgentの起動引数に保存され、未指定値は起動時にconfig fileから読みます。これらの値や環境設定、config fileの場所を変更した場合は `autostart install` を再実行してください。start/stop/statusは登録済み設定を書き換えません。
+
+```sh
+herdr plugin link /absolute/path/printed/as/plugin_dir
+```
+
+既に起動中のserverにはstartup hookが遡及発火しないため、link/enable後は一度だけ反映します。
+
+```sh
+uv run sessiongauge autostart start
+uv run sessiongauge autostart status
+```
+
+停止・解除は明示して行います。
+
+```sh
+herdr plugin disable <plugin-id>
+herdr plugin unlink <plugin-id>
+uv run sessiongauge autostart stop
+uv run sessiongauge autostart uninstall
+```
+
+pluginのstartupはHerdr SERVERの起動・handoff時に実行され、client attach/detachごとには実行されません。起動時は短いone-shot start actionからLaunchAgentへ渡り、monitor自身はherdr serverの一時不在時にもleaseを保持してbackoff/reconnectします。旧版の手動monitorはこのleaseに未対応なので、初回移行前にそのSessionGauge monitorだけ正常停止してください。Hermes/herdr本体は停止しません。
+
+連続TUIもcollector workerが終了してcollectorをcloseするまで同じscopeのleaseを保持します。画面終了後もworkerが処理中なら、同scopeのmonitor起動はworker終了まで拒否されます。
+
 履歴、詳細、出力の例:
 
 ```sh

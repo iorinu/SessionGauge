@@ -21,6 +21,12 @@ SessionGaugeが示すのはローカルで観測できた値です。欠損期�
 
 ## sidebarと動作環境
 
+- autostartはmacOSとherdr 0.9.2の範囲です。Python/runtimeのinstalled pathが変わる場合はLaunchAgentを再生成してください。pluginのlink/enableだけでは既存serverでstartupが発火しないため、`autostart start` が必要です。
+- autostartは `HERMES_HOME` とconfigが読む非secretな `SESSIONGAUGE_*` 環境設定、およびinstall時に明示したDB path・poll間隔・timezoneをLaunchAgentへ保存します。これらの設定を変えた場合は `autostart install` を再実行してください。
+- 連続TUIの排他leaseは画面が戻った時点ではなく、collector workerがcloseを終えて終了するまで保持します。
+- 旧版の手動monitorはOS leaseを持ちません。移行時はそのSessionGauge monitorだけを正常停止し、Hermes/herdr本体は停止しないでください。
+- autostartの実API通信、実herdr起動、実launchd反映はこの変更の自動テスト範囲外です。
+
 - metadata送信とherdrの実画面表示は別の確認事項です。metadataが届くことは、pixel上の描画やlayoutが正しい証拠にはなりません。
 - profile構成、Linux、未確認version、30 Pane同時稼働の実機負荷は網羅していません。
 - 実機Hermes DBはHermes自身が更新し得るため、ファイル全体のhash不変は保証できません。読み取り専用性はfixture DBで検証します。
