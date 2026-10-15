@@ -355,6 +355,10 @@ def _sidebar_factory(config):
             quota_reader=quota_reader,
             hermes_home=config.sidebar_quota_hermes_home,
             display=getattr(config, "sidebar_display", "percent"),
+            quota_mode=getattr(config, "sidebar_quota_mode", "estimate"),
+            estimate_max_age_seconds=getattr(
+                config, "sidebar_quota_estimate_max_age_seconds", 86400
+            ),
         )
 
         class ReportingCollector:

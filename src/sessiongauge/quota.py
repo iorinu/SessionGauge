@@ -5,7 +5,96 @@ import math
 import os
 import subprocess
 import time
+from datetime import UTC, datetime
 from pathlib import Path
+
+
+class TokenQuotaEstimator:
+    """プロセス内だけで保持する単一点比例推定器。"""
+
+    def __init__(self, max_age_seconds=86400, clock=None, wall_clock=None):
+        if type(max_age_seconds) is not int or max_age_seconds <= 0:
+            raise ValueError("max_age_seconds must be a positive integer")
+        self.max_age_seconds = max_age_seconds
+        self.clock = clock or time.monotonic
+        self.wall_clock = wall_clock or time.time
+        self._calibrations = {}
+        self._last_as_of = {}
+        self._last_tokens = {}
+
+    @staticmethod
+    def _valid_tokens(value):
+        return type(value) is int and value > 0 and value.bit_length() <= 1023
+
+    @staticmethod
+    def _valid_scope(profile_id, session_id, model):
+        return all(
+            isinstance(value, str) and value.strip() for value in (profile_id, session_id, model)
+        )
+
+    def calibrate(self, *, profile_id, session_id, model, total_tokens, percent, data_as_of):
+        if not self._valid_scope(profile_id, session_id, model) or not self._valid_tokens(
+            total_tokens
+        ):
+            return False
+        if isinstance(percent, bool) or not isinstance(percent, (int, float)):
+            return False
+        try:
+            percent = float(percent)
+        except (OverflowError, ValueError):
+            return False
+        if not math.isfinite(percent) or percent <= 0:
+            return False
+        if isinstance(data_as_of, bool) or not isinstance(data_as_of, (int, float)):
+            return False
+        try:
+            as_of = float(data_as_of)
+        except (OverflowError, ValueError):
+            return False
+        if not math.isfinite(as_of):
+            return False
+        age = self.wall_clock() - as_of
+        if age < 0 or age > self.max_age_seconds:
+            return False
+        key = (profile_id, session_id, model)
+        if self._last_as_of.get(key) is not None and as_of <= self._last_as_of[key]:
+            return False
+        self._last_as_of[key] = as_of
+        self._calibrations[key] = (total_tokens, percent, self.clock())
+        self._last_tokens[key] = total_tokens
+        return True
+
+    def invalidate(self, *, profile_id, session_id, model):
+        """校正とcounter追跡だけを破棄し、古いsample watermarkは保持する。"""
+        key = (profile_id, session_id, model)
+        self._calibrations.pop(key, None)
+        self._last_tokens.pop(key, None)
+
+    def estimate(self, *, profile_id, session_id, model, total_tokens):
+        if not self._valid_scope(profile_id, session_id, model):
+            return None
+        key = (profile_id, session_id, model)
+        if not self._valid_tokens(total_tokens):
+            self.invalidate(profile_id=profile_id, session_id=session_id, model=model)
+            return None
+        previous = self._last_tokens.get(key)
+        self._last_tokens[key] = total_tokens
+        calibration = self._calibrations.get(key)
+        if previous is not None and total_tokens < previous:
+            self._calibrations.pop(key, None)
+            return None
+        if calibration is None:
+            return None
+        base_tokens, percent, accepted = calibration
+        if self.clock() - accepted >= self.max_age_seconds or total_tokens < base_tokens:
+            self._calibrations.pop(key, None)
+            return None
+        try:
+            result = percent * (total_tokens / base_tokens)
+        except (OverflowError, ZeroDivisionError):
+            self._calibrations.pop(key, None)
+            return None
+        return result if math.isfinite(result) else None
 
 
 class QuotaReader:
@@ -39,6 +128,7 @@ class QuotaReader:
         )
         self._last_poll = None
         self._last_sessions_poll = None
+        self._last_metadata_poll = None
         self._cached = None
         self._sessions_cached = {}
 
@@ -133,6 +223,98 @@ class QuotaReader:
         except (OSError, subprocess.SubprocessError, ValueError, TypeError, OverflowError):
             self._sessions_cached = {}
         return dict(self._sessions_cached)
+
+    def read_session_metadata(self, threads):
+        """校正用metadata読取。legacy read_sessionsとは別の明示flagを使う。"""
+        if not isinstance(threads, list) or not 1 <= len(threads) <= 100:
+            return {}
+        if any(not isinstance(item, dict) for item in threads):
+            return {}
+        ids = [item.get("thread_id") for item in threads]
+        if (
+            not 1 <= len(ids) <= 100
+            or any(not isinstance(i, str) or not i.strip() or len(i) > 512 for i in ids)
+            or len(set(ids)) != len(ids)
+            or any(
+                set(item) != {"thread_id", "created_at", "descendant_thread_ids"}
+                or (item["created_at"] is not None and not isinstance(item["created_at"], str))
+                or item["descendant_thread_ids"] != []
+                for item in threads
+            )
+        ):
+            return {}
+        now = self.clock()
+        if (
+            self._last_metadata_poll is not None
+            and now - self._last_metadata_poll < self.poll_interval_seconds
+        ):
+            return {}
+        self._last_metadata_poll = now
+        if not self.auth_helper or not Path(self.auth_helper).is_file():
+            return {}
+        try:
+            result = self.runner(
+                [
+                    self.hermes_python,
+                    str(Path(__file__).with_name("hermes_usage_bridge.py")),
+                    "--hermes-root",
+                    self.hermes_root,
+                    "--auth-helper",
+                    self.auth_helper,
+                    "--include-metadata",
+                ],
+                input=json.dumps({"threads": threads}),
+                capture_output=True,
+                text=True,
+                timeout=35,
+                check=False,
+                env={**os.environ, "HERMES_HOME": self.hermes_home, "PYTHONDONTWRITEBYTECODE": "1"},
+            )
+            if result.returncode != 0:
+                return {}
+            payload = json.loads(result.stdout)
+            if (
+                not isinstance(payload, dict)
+                or set(payload) != {"threads", "data_as_of"}
+                or not isinstance(payload["threads"], list)
+            ):
+                return {}
+            output, seen = {}, set()
+            for row in payload["threads"]:
+                if (
+                    not isinstance(row, dict)
+                    or row.get("thread_id") not in ids
+                    or row["thread_id"] in seen
+                    or row.get("data_status") not in {"available", "partial", "unavailable"}
+                ):
+                    return {}
+                seen.add(row["thread_id"])
+                value = row.get("five_hour_limit_percent")
+                stamp = payload.get("data_as_of")
+                if row.get("data_status") != "available" or not self._valid_percent(value):
+                    continue
+                try:
+                    parsed = datetime.fromisoformat(stamp)
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if parsed.tzinfo is None:
+                    continue
+                as_of = parsed.astimezone(UTC).timestamp()
+                if as_of > datetime.now(UTC).timestamp():
+                    continue
+                output[row["thread_id"]] = {"percent": float(value), "data_as_of": as_of}
+            return output
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError, OverflowError):
+            return {}
+
+    @staticmethod
+    def _valid_percent(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        try:
+            return math.isfinite(float(value)) and value >= 0
+        except (OverflowError, ValueError):
+            return False
 
     def read(self):
         now = self.clock()

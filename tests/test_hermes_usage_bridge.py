@@ -176,3 +176,46 @@ def test_main_hides_arbitrary_request_exception(monkeypatch, capsys):
 def test_percent_handles_huge_integer_without_overflow():
     assert bridge._valid_percent(10**400) is False
     assert bridge._valid_percent(113.58) is True
+
+
+def test_metadata_mode_reads_top_level_as_of_and_only_whitelists_it(monkeypatch, tmp_path):
+    helper = tmp_path / "helper.py"
+    helper.write_text("def credentials(): return ('t','https://chatgpt.com','a')\n")
+    monkeypatch.setitem(sys.modules, "agent", SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.account_usage",
+        SimpleNamespace(_resolve_codex_usage_url=lambda base: base),
+    )
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {
+                "data_as_of": "2026-10-15T12:00:00Z",
+                "threads": [
+                    {
+                        "thread_id": "sid",
+                        "data_status": "available",
+                        "five_hour_limit_percent": 12.5,
+                        "data_as_of": "wrong-row-time",
+                        "groups": ["private"],
+                        "raw": "private",
+                    }
+                ],
+                "other": "private",
+            }
+
+    monkeypatch.setitem(sys.modules, "httpx", SimpleNamespace(post=lambda *a, **k: Response()))
+    assert bridge._request(tmp_path, helper, safe_threads(), include_metadata=True) == {
+        "data_as_of": "2026-10-15T12:00:00Z",
+        "threads": [
+            {
+                "thread_id": "sid",
+                "data_status": "available",
+                "five_hour_limit_percent": 12.5,
+            }
+        ],
+    }

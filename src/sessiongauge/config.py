@@ -15,6 +15,8 @@ class Config:
     sidebar_ttl_ms: int = 15000
     sidebar_time_zone: str = "local"
     sidebar_quota_enabled: bool = False
+    sidebar_quota_mode: str = "estimate"
+    sidebar_quota_estimate_max_age_seconds: int = 86400
     sidebar_quota_agent_resume_bin: str = "agent-resume"
     sidebar_quota_hermes_home: Path = Path.home() / ".hermes"
     sidebar_quota_poll_interval_seconds: int = 60
@@ -72,6 +74,8 @@ def load_config(
     if not isinstance(quota, dict):
         raise TypeError("sidebar.quota must be a table")
     values["sidebar_quota_enabled"] = quota.get("enabled", False)
+    values["sidebar_quota_mode"] = quota.get("mode", "estimate")
+    values["sidebar_quota_estimate_max_age_seconds"] = quota.get("estimate_max_age_seconds", 86400)
     values["sidebar_quota_agent_resume_bin"] = quota.get("agent_resume_bin", "agent-resume")
     values["sidebar_quota_hermes_home"] = quota.get(
         "hermes_home", env.get("HERMES_HOME", "~/.hermes")
@@ -118,6 +122,12 @@ def load_config(
         raise TypeError("sidebar.enabled must be a boolean")
     if not isinstance(values["sidebar_quota_enabled"], bool):
         raise TypeError("sidebar.quota.enabled must be a boolean")
+    quota_mode = values["sidebar_quota_mode"]
+    if not isinstance(quota_mode, str) or quota_mode not in ("estimate", "api"):
+        raise ValueError("sidebar.quota.mode must be 'estimate' or 'api'")
+    estimate_age = values["sidebar_quota_estimate_max_age_seconds"]
+    if type(estimate_age) is not int or estimate_age <= 0:
+        raise ValueError("sidebar.quota.estimate_max_age_seconds must be a positive integer")
     bin_path = values["sidebar_quota_agent_resume_bin"]
     if not isinstance(bin_path, str) or not bin_path.strip():
         raise ValueError("sidebar.quota.agent_resume_bin must be nonempty")
@@ -185,6 +195,8 @@ def load_config(
         ttl,
         str(values["sidebar_time_zone"]),
         values["sidebar_quota_enabled"],
+        quota_mode,
+        estimate_age,
         bin_path,
         Path(values["sidebar_quota_hermes_home"]).expanduser(),
         quota_interval,

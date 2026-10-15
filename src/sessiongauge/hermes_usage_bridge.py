@@ -78,7 +78,7 @@ def _audit_guard(event, args):
         raise PermissionError("access to protected path denied")
 
 
-def _request(root, helper, threads):
+def _request(root, helper, threads, include_metadata=False):
     root = str(Path(root).resolve())
     helper = Path(helper).resolve()
     sys.path.insert(0, root)
@@ -123,11 +123,12 @@ def _request(root, helper, threads):
     if not isinstance(rows, list):
         raise TypeError
     output, seen = [], set()
+    allowed_ids = {t["thread_id"] for t in threads}
     for row in rows:
         if (
             not isinstance(row, dict)
             or not isinstance(row.get("thread_id"), str)
-            or row["thread_id"] not in {t["thread_id"] for t in threads}
+            or row["thread_id"] not in allowed_ids
             or row["thread_id"] in seen
         ):
             raise ValueError
@@ -141,7 +142,11 @@ def _request(root, helper, threads):
                 "five_hour_limit_percent": percent if _valid_percent(percent) else None,
             }
         )
-    return {"threads": output}
+    result = {"threads": output}
+    stamp = payload.get("data_as_of")
+    if include_metadata and isinstance(stamp, str) and len(stamp) <= 128:
+        result["data_as_of"] = stamp
+    return result
 
 
 def main(argv=None):
@@ -149,12 +154,13 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--hermes-root", required=True)
     parser.add_argument("--auth-helper", required=True)
+    parser.add_argument("--include-metadata", action="store_true")
     args = parser.parse_args(argv)
     try:
         input_value = json.load(sys.stdin)
         threads, _ = _safe_threads(input_value)
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            result = _request(args.hermes_root, args.auth_helper, threads)
+            result = _request(args.hermes_root, args.auth_helper, threads, args.include_metadata)
         sys.stdout.write(json.dumps(result, allow_nan=False))
         return 0
     except Exception:  # noqa: BLE001 - CLI境界では詳細を漏らさず失敗を隠す

@@ -72,6 +72,8 @@ def test_sidebar_quota_config_and_validation(tmp_path, monkeypatch):
     assert config.sidebar_quota_enabled is True
     assert config.sidebar_quota_hermes_home == Path.home() / "custom"
     assert config.sidebar_quota_poll_interval_seconds == 45
+    assert config.sidebar_quota_mode == "estimate"
+    assert config.sidebar_quota_estimate_max_age_seconds == 86400
     path.write_text(
         '[sidebar.quota]\nhermes_root = "~/agent"\nhermes_python = "~/py"\nauth_helper = "~/bridge.py"\n'
     )
@@ -88,6 +90,10 @@ def test_sidebar_quota_config_and_validation(tmp_path, monkeypatch):
     assert defaults.sidebar_quota_hermes_root == Path.home() / ".hermes/hermes-agent"
     assert defaults.sidebar_quota_hermes_python is None
     assert defaults.sidebar_quota_auth_helper is None
+    path.write_text('[sidebar.quota]\nmode = "api"\nestimate_max_age_seconds = 42\n')
+    configured = load_config(config_path=path, environ={})
+    assert configured.sidebar_quota_mode == "api"
+    assert configured.sidebar_quota_estimate_max_age_seconds == 42
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "env-hermes"))
     assert (
         load_config(

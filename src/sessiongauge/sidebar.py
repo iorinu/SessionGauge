@@ -5,11 +5,12 @@ import subprocess
 import sys
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 
 from sessiongauge.adapters.herdr import HerdrAdapter
-from sessiongauge.quota import QuotaReader
+from sessiongauge.quota import QuotaReader, TokenQuotaEstimator
 
 
 def _format_tokens(tokens):
@@ -47,10 +48,33 @@ class SidebarReporter:
         quota_reader=None,
         hermes_home="~/.hermes",
         display="percent",
+        quota_mode="api",
+        estimate_max_age_seconds=86400,
+        monotonic_clock=None,
+        wall_clock=None,
     ):
         if display not in ("percent", "percent_tokens"):
             raise ValueError("display must be 'percent' or 'percent_tokens'")
         self.display = display
+        if quota_mode not in ("estimate", "api"):
+            raise ValueError("quota_mode must be 'estimate' or 'api'")
+        self.quota_mode = quota_mode
+        self._monotonic_clock = monotonic_clock or time.monotonic
+        self._wall_clock = wall_clock or time.time
+        self.estimator = TokenQuotaEstimator(
+            estimate_max_age_seconds, self._monotonic_clock, self._wall_clock
+        )
+        self._estimators = {}
+        self._estimate_max_age_seconds = estimate_max_age_seconds
+        self._quota_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="quota-metadata"
+        )
+        self._quota_future = None
+        self._quota_future_context = None
+        self._estimate_scopes = {}
+        self._estimate_generations = {}
+        self._closed = False
+        self._last_quota_submit = None
         self.enabled = enabled
         self.ttl_ms = ttl_ms
         self.runner = runner or subprocess.run
@@ -169,7 +193,15 @@ class SidebarReporter:
             return False
 
     def publish(self, data, observed_panes=None):
-        if not self.enabled or data.get("stale") or not self._supports():
+        if self._closed:
+            return
+        if not self.enabled:
+            return
+        if data.get("stale"):
+            self._sync_estimate_scopes({})
+            return
+        if not self._supports():
+            self._sync_estimate_scopes({})
             return
         panes = data.get("panes", [])
         counts = {}
@@ -189,6 +221,7 @@ class SidebarReporter:
         try:
             current = self.adapter.list_panes()
         except (OSError, ValueError, subprocess.SubprocessError, TypeError):
+            self._sync_estimate_scopes({})
             return
         for row in panes:
             session = row.get("session") or {}
@@ -224,19 +257,31 @@ class SidebarReporter:
                 if self.quota_enabled and row.get("profile") == self.quota_profile_id:
                     quota_targets.add(key)
         quota = {}
+        sessions_by_key = {}
+        for row in panes:
+            session = row.get("session") or {}
+            sid = session.get("id")
+            if (
+                row.get("status") == "matched"
+                and sid
+                and row.get("profile") == self.quota_profile_id
+            ):
+                key = next((k for k, value in live.items() if value[0] == sid), None)
+                if key in quota_targets:
+                    sessions_by_key[key] = session
+        desired_scopes = {}
+        for key in quota_targets:
+            sid, tokens = live[key]
+            session = sessions_by_key.get(key, {})
+            model = session.get("model")
+            if isinstance(model, str) and model.strip():
+                desired_scopes[key] = (
+                    (self.quota_profile_id, sid, model),
+                    tokens,
+                )
+        if self.quota_mode == "estimate":
+            self._sync_estimate_scopes(desired_scopes)
         if self.quota_enabled and quota_targets:
-            sessions_by_key = {}
-            for row in panes:
-                session = row.get("session") or {}
-                sid = session.get("id")
-                if (
-                    row.get("status") == "matched"
-                    and sid
-                    and row.get("profile") == self.quota_profile_id
-                ):
-                    key = next((k for k, value in live.items() if value[0] == sid), None)
-                    if key in quota_targets:
-                        sessions_by_key[key] = session
             threads = []
             for key in sorted(quota_targets, key=lambda item: str(item)):
                 session = sessions_by_key.get(key, {})
@@ -263,13 +308,28 @@ class SidebarReporter:
                         "descendant_thread_ids": [],
                     }
                 )
-            try:
-                if len(threads) <= 100:
-                    quota = self.quota_reader.read_sessions(threads)
-                if not isinstance(quota, dict):
+            if self.quota_mode == "api":
+                try:
+                    if len(threads) <= 100:
+                        quota = self.quota_reader.read_sessions(threads)
+                    if not isinstance(quota, dict):
+                        quota = {}
+                except (OSError, subprocess.SubprocessError, ValueError, TypeError, OverflowError):
                     quota = {}
-            except (OSError, subprocess.SubprocessError, ValueError, TypeError, OverflowError):
-                quota = {}
+            elif len(threads) <= 100 and not self._closed:
+                self._collect_estimates(threads, sessions_by_key, live, quota_targets)
+                quota = {
+                    sid: self._estimator_for(
+                        (self.quota_profile_id, sid, (sessions_by_key.get(key) or {}).get("model"))
+                    ).estimate(
+                        profile_id=self.quota_profile_id,
+                        session_id=sid,
+                        model=(sessions_by_key.get(key) or {}).get("model"),
+                        total_tokens=tokens,
+                    )
+                    for key, (sid, tokens) in live.items()
+                    if key in quota_targets
+                }
         for key in self._owned.keys() - live.keys():
             if key[1] in blocked:
                 continue
@@ -291,13 +351,19 @@ class SidebarReporter:
                     if isinstance(value, (int, float)) and not isinstance(value, bool)
                     else "N/A"
                 )
+                if self.quota_mode == "estimate" and value is not None:
+                    token = "~" + token
             elif key in quota_targets:
                 value = quota.get(sid)
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     percent = f"{value:.2f}".rstrip("0").rstrip(".")
-                    token = f"5h {percent}% · {token}"
+                    token = (
+                        f"~{percent}% · {token}"
+                        if self.quota_mode == "estimate"
+                        else f"5h {percent}% · {token}"
+                    )
                 else:
-                    token = f"5h N/A · {token}"
+                    token = f"{'N/A' if self.quota_mode == 'estimate' else '5h N/A'} · {token}"
             if self._send(key[1], token=token):
                 self._owned[key] = sid
 
@@ -306,6 +372,89 @@ class SidebarReporter:
             self._send(key[1], clear=True)
             self._owned.pop(key, None)
 
+    def _sync_estimate_scopes(self, desired):
+        """各paneの有効scopeを更新し、変化した世代の校正を破棄する。"""
+        previous = self._estimate_scopes
+        for key in previous.keys() | desired.keys():
+            old = previous.get(key)
+            new = desired.get(key)
+            if old is not None and new is not None and old[0] == new[0] and new[1] >= old[1]:
+                previous[key] = new
+                continue
+            self._estimate_generations[key] = self._estimate_generations.get(key, 0) + 1
+            if old is not None:
+                profile, sid, model = old[0]
+                self._estimator_for((profile, sid, model)).invalidate(
+                    profile_id=profile, session_id=sid, model=model
+                )
+        self._estimate_scopes = dict(desired)
+
+    def _estimator_for(self, scope):
+        if scope not in self._estimators:
+            self._estimators[scope] = TokenQuotaEstimator(
+                self._estimate_max_age_seconds, self._monotonic_clock, self._wall_clock
+            )
+        return self._estimators[scope]
+
     def close(self):
+        self._closed = True
+        self._quota_executor.shutdown(wait=False, cancel_futures=True)
         if self.enabled:
             self._clear_all()
+
+    def _collect_estimates(self, threads, sessions_by_key, live, quota_targets):
+        if self._quota_future is not None and self._quota_future.done():
+            try:
+                rows = self._quota_future.result()
+                for key, ctx in self._quota_future_context.items():
+                    current = live.get(key)
+                    session_now = sessions_by_key.get(key, {})
+                    if (
+                        current is None
+                        or current[0] != ctx["sid"]
+                        or session_now.get("model") != ctx["model"]
+                        or key not in quota_targets
+                        or (
+                            "generation" in ctx
+                            and self._estimate_generations.get(key, 0) != ctx["generation"]
+                        )
+                    ):
+                        continue
+                    row = rows.get(ctx["sid"], {}) if isinstance(rows, dict) else {}
+                    estimator = self._estimator_for((ctx["profile"], ctx["sid"], ctx["model"]))
+                    estimator.calibrate(
+                        profile_id=ctx["profile"],
+                        session_id=ctx["sid"],
+                        model=ctx["model"],
+                        total_tokens=ctx["tokens"],
+                        percent=row.get("percent"),
+                        data_as_of=row.get("data_as_of"),
+                    )
+            except (OSError, ValueError, TypeError, RuntimeError):
+                pass
+            self._quota_future = None
+            self._quota_future_context = None
+        now = self._monotonic_clock()
+        interval = getattr(self.quota_reader, "poll_interval_seconds", 60)
+        if (
+            self._quota_future is None
+            and not self._closed
+            and (self._last_quota_submit is None or now - self._last_quota_submit >= interval)
+        ):
+            contexts = {}
+            for key in quota_targets:
+                sid, tokens = live[key]
+                session = sessions_by_key.get(key, {})
+                contexts[key] = {
+                    "sid": sid,
+                    "tokens": tokens,
+                    "model": session.get("model"),
+                    "profile": self.quota_profile_id,
+                    "generation": self._estimate_generations.get(key, 0),
+                }
+            if contexts and hasattr(self.quota_reader, "read_session_metadata"):
+                self._quota_future_context = contexts
+                self._last_quota_submit = now
+                self._quota_future = self._quota_executor.submit(
+                    self.quota_reader.read_session_metadata, threads
+                )
