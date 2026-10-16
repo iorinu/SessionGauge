@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import re
 import subprocess
 import time
 from datetime import UTC, datetime
@@ -82,6 +83,105 @@ class QuotaReader:
         self._last_metadata_poll = None
         self._cached = None
         self._sessions_cached = {}
+
+    def read_estimate_context(self, threads):
+        """安全なthread sampleと検証済みaccounting windowだけを返す。"""
+        try:
+            from .hermes_usage_bridge import _safe_threads
+
+            _, ids = _safe_threads({"threads": threads})
+        except (TypeError, ValueError):
+            return {}
+        if not self.auth_helper or not Path(self.auth_helper).is_file():
+            return {}
+        try:
+            result = self.runner(
+                [
+                    self.hermes_python,
+                    str(Path(__file__).with_name("hermes_usage_bridge.py")),
+                    "--hermes-root",
+                    self.hermes_root,
+                    "--auth-helper",
+                    self.auth_helper,
+                    "--include-window",
+                ],
+                input=json.dumps({"threads": threads}),
+                capture_output=True,
+                text=True,
+                timeout=35,
+                check=False,
+                env={**os.environ, "HERMES_HOME": self.hermes_home, "PYTHONDONTWRITEBYTECODE": "1"},
+            )
+            if result.returncode != 0:
+                return {}
+            payload = json.loads(result.stdout)
+            if not isinstance(payload, dict) or set(payload) != {
+                "threads",
+                "data_as_of",
+                "window",
+                "account_scope",
+            }:
+                return {}
+            scope = payload["account_scope"]
+            if not isinstance(scope, str) or re.fullmatch(r"[0-9a-f]{64}", scope) is None:
+                return {}
+            window = payload["window"]
+            if not isinstance(window, dict) or set(window) != {"start", "end"}:
+                return {}
+            start, end = window["start"], window["end"]
+            if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in (start, end)):
+                return {}
+            start, end = float(start), float(end)
+            now = time.time()
+            if (
+                not math.isfinite(start)
+                or not math.isfinite(end)
+                or not math.isclose(end - start, 18000, rel_tol=0, abs_tol=1e-6)
+                or not start <= now < end
+            ):
+                return {}
+            stamp = payload["data_as_of"]
+            as_of = None
+            if isinstance(stamp, str) and len(stamp) <= 128:
+                try:
+                    parsed = datetime.fromisoformat(stamp)
+                    if parsed.tzinfo is not None:
+                        candidate = parsed.astimezone(UTC).timestamp()
+                        if candidate <= now:
+                            as_of = candidate
+                except (OverflowError, ValueError):
+                    pass
+            samples = {}
+            rows = payload["threads"]
+            if not isinstance(rows, list):
+                return {}
+            seen = set()
+            for row in rows:
+                if (
+                    not isinstance(row, dict)
+                    or not isinstance(row.get("thread_id"), str)
+                    or row["thread_id"] not in ids
+                    or row["thread_id"] in seen
+                    or row.get("data_status") not in {"available", "partial", "unavailable"}
+                ):
+                    return {}
+                sid = row["thread_id"]
+                seen.add(sid)
+                value = row.get("five_hour_limit_percent")
+                if (
+                    as_of is not None
+                    and row["data_status"] == "available"
+                    and self._valid_percent(value)
+                ):
+                    samples[sid] = {"percent": float(value), "data_as_of": as_of}
+            return {
+                "samples": samples,
+                "window_start": start,
+                "window_end": end,
+                "account_scope": scope,
+            }
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError, OverflowError):
+            return {}
 
     @staticmethod
     def _detect_helper(binary):

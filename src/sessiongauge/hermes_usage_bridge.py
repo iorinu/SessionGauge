@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -78,7 +79,7 @@ def _audit_guard(event, args):
         raise PermissionError("access to protected path denied")
 
 
-def _request(root, helper, threads, include_metadata=False):
+def _request(root, helper, threads, include_metadata=False, include_window=False):
     root = str(Path(root).resolve())
     helper = Path(helper).resolve()
     sys.path.insert(0, root)
@@ -91,7 +92,8 @@ def _request(root, helper, threads, include_metadata=False):
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         token, base_url, account_id = module.credentials()
     usage_module = __import__("agent.account_usage", fromlist=["_resolve_codex_usage_url"])
-    url = usage_module._resolve_codex_usage_url(base_url).rstrip("/") + "/thread_usage/query_v2"
+    usage_url = usage_module._resolve_codex_usage_url(base_url).rstrip("/")
+    url = usage_url + "/thread_usage/query_v2"
     parsed = urlsplit(url)
     if (
         parsed.scheme != "https"
@@ -104,17 +106,18 @@ def _request(root, helper, threads, include_metadata=False):
         raise ValueError
     import httpx
 
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "codex-cli",
+        **({"ChatGPT-Account-Id": account_id} if account_id else {}),
+    }
     response = httpx.post(
         url,
         json={"threads": threads},
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "codex-cli",
-            **({"ChatGPT-Account-Id": account_id} if account_id else {}),
-        },
-        timeout=20,
+        headers=headers,
+        timeout=10 if include_window else 20,
         follow_redirects=False,
     )
     response.raise_for_status()
@@ -142,10 +145,56 @@ def _request(root, helper, threads, include_metadata=False):
                 "five_hour_limit_percent": percent if _valid_percent(percent) else None,
             }
         )
-    result = {"threads": output}
     stamp = payload.get("data_as_of")
-    if include_metadata and isinstance(stamp, str) and len(stamp) <= 128:
-        result["data_as_of"] = stamp
+    safe_stamp = stamp if isinstance(stamp, str) and len(stamp) <= 128 else None
+    if include_window:
+        account_response = httpx.get(usage_url, headers=headers, timeout=10, follow_redirects=False)
+        account_response.raise_for_status()
+        account_data = account_response.json()
+        if not isinstance(account_data, dict):
+            raise ValueError
+        response_account = account_data.get("account_id")
+        plan = account_data.get("plan_type")
+        if (
+            not isinstance(response_account, str)
+            or not response_account.strip()
+            or not isinstance(plan, str)
+            or not plan.strip()
+            or (account_id and account_id != response_account)
+        ):
+            raise ValueError
+        rate_limit = account_data.get("rate_limit")
+        if not isinstance(rate_limit, dict):
+            raise ValueError
+        primary = rate_limit.get("primary_window")
+        if not isinstance(primary, dict):
+            raise ValueError
+        reset = primary.get("reset_at")
+        duration = primary.get("limit_window_seconds")
+        if (
+            isinstance(reset, bool)
+            or not isinstance(reset, (int, float))
+            or not math.isfinite(float(reset))
+            or isinstance(duration, bool)
+            or duration != 18000
+        ):
+            raise ValueError
+        end = float(reset)
+        start = end - 18000
+        import time
+
+        now = time.time()
+        if not (start <= now < end):
+            raise ValueError
+        return {
+            "threads": output,
+            "data_as_of": safe_stamp,
+            "window": {"start": start, "end": end},
+            "account_scope": hashlib.sha256((response_account + "\0" + plan).encode()).hexdigest(),
+        }
+    result = {"threads": output}
+    if include_metadata and safe_stamp is not None:
+        result["data_as_of"] = safe_stamp
     return result
 
 
@@ -155,12 +204,20 @@ def main(argv=None):
     parser.add_argument("--hermes-root", required=True)
     parser.add_argument("--auth-helper", required=True)
     parser.add_argument("--include-metadata", action="store_true")
+    parser.add_argument("--include-window", action="store_true")
     args = parser.parse_args(argv)
     try:
         input_value = json.load(sys.stdin)
         threads, _ = _safe_threads(input_value)
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            result = _request(args.hermes_root, args.auth_helper, threads, args.include_metadata)
+            if args.include_window:
+                result = _request(
+                    args.hermes_root, args.auth_helper, threads, args.include_metadata, True
+                )
+            else:
+                result = _request(
+                    args.hermes_root, args.auth_helper, threads, args.include_metadata
+                )
         sys.stdout.write(json.dumps(result, allow_nan=False))
         return 0
     except Exception:  # noqa: BLE001 - CLI境界では詳細を漏らさず失敗を隠す

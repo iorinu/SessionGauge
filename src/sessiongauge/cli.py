@@ -548,6 +548,23 @@ def _sidebar_factory(config):
             if getattr(config, "sidebar_quota_auth_helper", None)
             else None,
         )
+        window_estimator = None
+        if (
+            config.sidebar_enabled
+            and config.sidebar_quota_enabled
+            and getattr(config, "sidebar_quota_mode", None) == "estimate"
+            and hasattr(inner_config, "data_dir")
+        ):
+            from sessiongauge.quota_history import QuotaHistory
+            from sessiongauge.window_estimator import WindowQuotaEstimator
+
+            source_path = Path(config.sidebar_quota_hermes_home).expanduser() / "state.db"
+            profile_id = str(uuid.uuid5(uuid.NAMESPACE_URL, str(source_path.resolve(strict=False))))
+            window_estimator = WindowQuotaEstimator(
+                QuotaHistory(inner_config.data_dir / "monitor.db", source_path, profile_id),
+                quota_reader,
+                getattr(config, "sidebar_quota_estimate_max_age_seconds", 86400),
+            )
         reporter = SidebarReporter(
             enabled=config.sidebar_enabled,
             ttl_ms=config.sidebar_ttl_ms,
@@ -559,6 +576,7 @@ def _sidebar_factory(config):
             estimate_max_age_seconds=getattr(
                 config, "sidebar_quota_estimate_max_age_seconds", 86400
             ),
+            window_estimator=window_estimator,
         )
 
         class ReportingCollector:

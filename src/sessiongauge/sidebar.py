@@ -53,6 +53,7 @@ class SidebarReporter:
         estimate_max_age_seconds=86400,
         monotonic_clock=None,
         wall_clock=None,
+        window_estimator=None,
     ):
         if display not in ("percent", "percent_tokens"):
             raise ValueError("display must be 'percent' or 'percent_tokens'")
@@ -60,6 +61,7 @@ class SidebarReporter:
         if quota_mode not in ("estimate", "api"):
             raise ValueError("quota_mode must be 'estimate' or 'api'")
         self.quota_mode = quota_mode
+        self.window_estimator = window_estimator
         self._monotonic_clock = monotonic_clock or time.monotonic
         self._wall_clock = wall_clock or time.time
         self.estimator = TokenQuotaEstimator(
@@ -285,8 +287,12 @@ class SidebarReporter:
             self._sync_estimate_scopes(desired_scopes)
             if self.quota_enabled and quota_targets and not self._quota_accuracy_warned:
                 self.warning(
-                    f"{self.estimator.unavailable_reason}; estimate mode remains N/A. "
-                    "percent_tokens shows local counts; api mode shows the provider's raw task budget, not current-window accuracy."
+                    (
+                        "Ranges assume stable same-model bucket rates and provider cutoff; they are not empirical accuracy guarantees. "
+                        if self.window_estimator is not None
+                        else f"{self.estimator.unavailable_reason}; estimate mode remains N/A. "
+                    )
+                    + "percent_tokens shows local counts; api mode shows the provider's raw task budget, not current-window accuracy."
                 )
                 self._quota_accuracy_warned = True
         if self.quota_enabled and quota_targets:
@@ -325,19 +331,34 @@ class SidebarReporter:
                 except (OSError, subprocess.SubprocessError, ValueError, TypeError, OverflowError):
                     quota = {}
             elif len(threads) <= 100 and not self._closed:
-                self._collect_estimates(threads, sessions_by_key, live, quota_targets)
-                quota = {
-                    sid: self._estimator_for(
-                        (self.quota_profile_id, sid, (sessions_by_key.get(key) or {}).get("model"))
-                    ).estimate(
-                        profile_id=self.quota_profile_id,
-                        session_id=sid,
-                        model=(sessions_by_key.get(key) or {}).get("model"),
-                        total_tokens=tokens,
-                    )
-                    for key, (sid, tokens) in live.items()
-                    if key in quota_targets
-                }
+                if self.window_estimator is not None:
+                    try:
+                        targets = {
+                            live[k][0]: sessions_by_key[k]
+                            for k in quota_targets
+                            if k in sessions_by_key
+                        }
+                        quota = self.window_estimator.estimates(targets)
+                    except (OSError, ValueError, TypeError, RuntimeError, KeyError, OverflowError):
+                        quota = {}
+                else:
+                    self._collect_estimates(threads, sessions_by_key, live, quota_targets)
+                    quota = {
+                        sid: self._estimator_for(
+                            (
+                                self.quota_profile_id,
+                                sid,
+                                (sessions_by_key.get(key) or {}).get("model"),
+                            )
+                        ).estimate(
+                            profile_id=self.quota_profile_id,
+                            session_id=sid,
+                            model=(sessions_by_key.get(key) or {}).get("model"),
+                            total_tokens=tokens,
+                        )
+                        for key, (sid, tokens) in live.items()
+                        if key in quota_targets
+                    }
         for key in self._owned.keys() - live.keys():
             if key[1] in blocked:
                 continue
@@ -355,15 +376,22 @@ class SidebarReporter:
             if self.display == "percent":
                 value = quota.get(sid) if key in quota_targets else None
                 token = (
-                    "API " + f"{value:.2f}".rstrip("0").rstrip(".") + "%"
-                    if self._valid_display_percent(value)
-                    else "N/A"
+                    (self._format_window(value) or "N/A")
+                    if self.window_estimator is not None and self.quota_mode == "estimate"
+                    else (
+                        "API " + f"{value:.2f}".rstrip("0").rstrip(".") + "%"
+                        if self._valid_display_percent(value)
+                        else "N/A"
+                    )
                 )
             elif key in quota_targets:
                 value = quota.get(sid)
                 if self.quota_mode == "api" and self._valid_display_percent(value):
                     percent = f"{value:.2f}".rstrip("0").rstrip(".")
                     token = f"API {percent}% · {token}"
+                elif self.window_estimator is not None and self.quota_mode == "estimate":
+                    formatted = self._format_window(value)
+                    token = f"{formatted if formatted else 'N/A'} · {token}"
                 else:
                     token = f"{'N/A' if self.quota_mode == 'estimate' else 'API N/A'} · {token}"
             if self._send(key[1], token=token):
@@ -408,10 +436,40 @@ class SidebarReporter:
         return self._estimators[scope]
 
     def close(self):
+        if self._closed:
+            return
         self._closed = True
+        if self.window_estimator is not None:
+            self.window_estimator.close()
         self._quota_executor.shutdown(wait=False, cancel_futures=True)
         if self.enabled:
             self._clear_all()
+
+    @staticmethod
+    def _format_window(value):
+        from sessiongauge.window_quota import QuotaEstimate
+
+        if not isinstance(value, QuotaEstimate) or not SidebarReporter._valid_display_percent(
+            value.lower
+        ):
+            return None
+        if value.lower == 0 and value.upper is None:
+            return None
+        try:
+            lower = math.floor(value.lower * 10) / 10
+        except (OverflowError, ValueError):
+            return None
+        if value.upper is None:
+            return f"~≥{lower:.1f}%"
+        if not SidebarReporter._valid_display_percent(value.upper) or value.upper < value.lower:
+            return None
+        if value.lower == value.upper:
+            return f"~{value.lower:.1f}%"
+        try:
+            upper = math.ceil(value.upper * 10) / 10
+        except (OverflowError, ValueError):
+            return None
+        return f"~{lower:.1f}–{upper:.1f}%"
 
     def _collect_estimates(self, threads, sessions_by_key, live, quota_targets):
         if self._quota_future is not None and self._quota_future.done():
