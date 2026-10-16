@@ -12,12 +12,13 @@ SessionGaugeが示すのはローカルで観測できた値です。欠損期�
 
 ## quota表示
 
-- `estimate` modeは停止されており、サンプルがあっても常に `N/A` です。APIのaccounting window、分母、input/output/cache等の重み付けとローカルcounterの対応を検証できません。
+- `estimate` modeは5時間枠の条件付き使用量範囲です。provider timestampが各行の完成済みcounter cutoffであること、primary windowの意味、同一modelのbucket rateが非負かつ一定であることは未検証の上流仮定です。同一modelでも速度・reasoning・service係数が変わり得ます。snapshot範囲計算は観測間でcounterが非減少と仮定します。観測されたdecrease/resetは拒否しますが、長いpoll gap内で起きて回復した未観測resetは端点から検出できず、全観測値が非減少でもresetがなかった証拠にはなりません。自動的な最大gap policyはありません。範囲はbucketの単位重み付けとsnapshot時刻の不確かさを表すだけで、経験的信頼区間でも認証済み誤差境界でもありません。
+- 参照候補は同一profileの最大3件の過去root sessionです。current SIDのAPI参照も使えます。履歴欠損、model混在、観測されたreset/decrease、未来・不正時刻、window/context不整合、古い参照はN/Aになります。`empirical_error_percent` は独立検証がないため未定義のままで、学習用に0とはしません。
 - `api` modeはproviderのraw task budget参照を `API 12%` のように表示します。これは現在windowのsession quota精度を保証せず、現在windowの残量として解釈できません。
-- native APIは一度に最大100件のroot threadを照会します。対象が101件以上なら全対象が `N/A` になります。子threadの利用量は合算しません。
+- native APIは一度に最大100件のroot threadを照会します。対象SIDと参照候補を合わせて100件を超えると参照処理を行いません。子threadの利用量は合算しません。
 - 対象はquota設定の `hermes_home` に対応するprofileの、一意に照合できたSIDです。他profile、quota無効時にはquotaを取得しません。割合のみ表示が既定で、旧token数との併記は `percent_tokens` を明示した場合だけです。
-- 照会間隔は既定60秒、設定範囲30〜3600秒です。`estimate_max_age_seconds` は互換性設定として残りますが、推定を有効化しません。
-- quotaは外部APIへのopt-in照会で、monitor DBやexportには保存しません。認証・送信データの範囲は[アーキテクチャ](architecture.md)を参照してください。
+- 照会間隔は既定60秒、設定範囲30〜3600秒です。context freshnessは最大 `max(35秒, 2 × poll間隔)`、参照鮮度は既定86400秒です。重複応答は参照鮮度を延長しません。
+- quotaは外部APIへのopt-in照会で、monitor DBやexportには保存しません。送信対象には最大3件の履歴root SIDと開始時刻が追加され、同じ許可済みhostへのaccount GETも行います。認証・送信データの範囲は[アーキテクチャ](architecture.md)を参照してください。
 
 ## sidebarと動作環境
 

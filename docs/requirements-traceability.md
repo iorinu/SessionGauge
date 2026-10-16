@@ -27,7 +27,7 @@
 
 | 機能 | 実装根拠 | テスト根拠 | 証拠レベル |
 |---|---|---|---|
-| SID別quota取得と表示 | `src/sessiongauge/quota.py::QuotaReader.read_sessions`; `src/sessiongauge/hermes_usage_bridge.py::_request`; `src/sessiongauge/sidebar.py::SidebarReporter.publish` | `test_reads_percentages_by_exact_id_when_response_order_differs`; `test_missing_or_nonavailable_is_unknown`; `test_session_values_fail_closed_or_keep_valid_out_of_range_above_100`; `test_cache_is_per_id_and_failure_clears_previous_values` — `tests/test_session_quota.py` | unit/fixture。実API・metadataの実機確認は[検証記録](verification.md)参照 |
+| SID別raw quota表示・条件付きwindow範囲 | `src/sessiongauge/quota.py::QuotaReader`; `src/sessiongauge/hermes_usage_bridge.py::_request`; `src/sessiongauge/quota_history.py::QuotaHistory`; `src/sessiongauge/window_quota.py::estimate_bounds`; `src/sessiongauge/window_estimator.py::WindowQuotaEstimator`; `src/sessiongauge/sidebar.py::SidebarReporter.publish` | `test_reads_percentages_by_exact_id_when_response_order_differs`; `test_estimate_bounds_uses_independent_bucket_weighting_for_window_usage`; `test_history_is_readonly_scoped_and_brackets_uncertainty`; `test_pending_job_uses_real_buckets_window_and_one_reference_job`; `test_window_formatter_fails_closed_and_preserves_unbounded_ranges` | unit/fixture。限定read-only API probeは[検証記録](verification.md)参照。精度保証ではない |
 | percent / percent_tokens設定 | `src/sessiongauge/config.py::load_config`; `src/sessiongauge/sidebar.py::SidebarReporter` | `test_sidebar_display_precedence_and_validation`; `test_sidebar_quota_config_and_validation` — `tests/test_sidebar_config.py` | unit。実機metadata確認あり、pixel描画未確認 |
 
 quotaはSIDとの厳密な対応、API通信、privacy境界を持つopt-in拡張です。詳細は[アーキテクチャ](architecture.md)と[既知の制限](known-limitations.md)を参照してください。

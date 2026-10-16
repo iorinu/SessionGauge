@@ -1,7 +1,7 @@
 # ADR 0001: token増分によるquota割合の推定
 
 - 日付: 2026-10-15
-- ステータス: Issue #2の精度検証を満たせず停止
+- ステータス: superseded（2026-10-16、ADR 0002）。当時の決定は歴史記録。
 
 ## 概要
 
@@ -11,7 +11,7 @@
 
 現状、ローカル収集とquota表示は別経路であり、SID別quotaはAPI応答を表示する。APIが成功しても `unavailable` になる場合や、`available` でも照会時刻より古い `data_as_of` に対して同じ値が返る実測があった。根本原因をAPI制限や集計遅延と断定はしない。
 
-ローカルの `total_tokens` は `input_tokens + output_tokens`。cache/reasoningを追加合算すると二重計上になる。収集開始前の累計値はbaselineとして取得できるが、過去の期間別使用量や時刻ごとの増分は復元できない。
+ローカルの従来表示用 `total_tokens` は `input_tokens + output_tokens` として維持する。現行SDKのcanonical bucketはuncached input、cache read、cache write、outputを別々に扱うため、cacheを一律に追加合算すれば二重計上になるとは宣言できない。現在のquota推定はADR 0002に従い4 bucketを使う。この記述は現行実装についてのclarificationであり、当時の決定の書き換えではない。収集開始前の累計値はbaselineとして取得できるが、過去の期間別使用量や時刻ごとの増分は復元できない。
 
 ## 決定
 

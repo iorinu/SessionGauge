@@ -23,7 +23,7 @@ ttl_ms = 15000
 # 任意。割合の取得・推定機能（quota自体は既定無効）
 [sidebar.quota]
 enabled = false
-# estimate（既定、精度契約未確認のためN/A）またはprovider raw値を表示する api
+# estimate（既定、条件付き5時間枠使用量範囲）またはprovider raw値を表示する api
 mode = "estimate"
 estimate_max_age_seconds = 86400
 agent_resume_bin = "agent-resume"

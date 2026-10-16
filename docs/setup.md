@@ -95,7 +95,7 @@ estimate_max_age_seconds = 86400
 # auth_helper = "/path/to/agent-resume/adapters/hermes_bridge.py"
 ```
 
-`display = "percent_tokens"` にすると表示値とローカルtoken数を併記します。`ttl_ms` の既定値は15000です。modeは `estimate` が既定ですが、accounting window・分母・token重み付けを検証できないため常に `N/A` です。`mode = "api"` はproviderのraw task budget参照を `API 12%` と表示し、現在windowの正確なquota率とはみなしません。`estimate_max_age_seconds` は互換性のため設定可能ですが、推定を有効化しません。poll間隔は既定60秒、設定範囲30〜3600秒です。SDK Pythonは `hermes_root/venv/bin/python`、認証helperはagent-resume配置から既定検出します。検出できない場合だけ任意のパスを指定してください。
+`display = "percent_tokens"` にすると表示値とローカルtoken数を併記します。`ttl_ms` の既定値は15000です。`estimate` は5時間枠の条件付き使用量範囲です。表示例 `~2.6–9.1%` は合成例で、実利用者の値ではありません。正確な割合・残量・アカウント全体のshareではなく、経験的信頼区間や誤差保証でもありません。参照やmodel整合性が不十分ならN/Aです。`api` はprovider raw task budgetを `API 12%` と表示します。`estimate_max_age_seconds` の既定は86400秒で、基準時刻 `data_as_of` からの鮮度を制限します。重複照会で鮮度は延長されません。poll間隔は既定60秒、設定範囲30〜3600秒です。SDK Pythonは `hermes_root/venv/bin/python`、認証helperはagent-resume配置から既定検出します。検出できない場合だけ任意のパスを指定してください。
 
 herdr設定の `[ui.sidebar.agents.rows_by_agent]` では、既定の先頭行を保ち、専用tokenを別行に追加できます。agent名はherdrが提供するため、metadataに重ねて含めない例です。
 
@@ -122,9 +122,9 @@ Ctrl-CでSessionGaugeを終了します。終了時にSessionGauge自身のsideb
 
 ## quota照会とプライバシー
 
-quota機能はSIDごとにCodex nativeの `five_hour_limit_percent` を取得します。`api` modeで表示する値はproviderのraw task budget参照であり、現在windowのsession quota精度を保証しません。API応答にはwindow境界・分母・ローカルtokenとの対応がありません。Hermes SDKの通常のcredential resolverと既存agent-resume helperを使い、`https://chatgpt.com` または `https://api.openai.com` の許可済みhostにある `thread_usage/query_v2` だけへ読み取り専用POSTを送ります。認証情報はAuthorizationヘッダーに使われ、利用可能な場合はChatGPT-Account-Idもヘッダーに含まれます。本文は対象thread ID、開始時刻、空のdescendant一覧です。会話本文、タイトル、cwdは送りません。credential storeをSessionGaugeが直接解析・保存せず、raw responseやcredentialをログ・永続化しません。
+quota機能はSIDごとにCodex nativeの `five_hour_limit_percent` を取得します。`api` modeはprovider raw task budget参照を表示します。`estimate` modeでは追加で同じ許可済みhostへaccount GETを行い、primary windowのreset時刻と5時間長を使います。POST本文は対象thread ID、開始時刻、空のdescendant一覧です。current SIDに加え、同一profileの過去root session最大3件を参照候補として照会する場合があります。送るのはSID・開始時刻・空のdescendant一覧だけで、token数、model、会話本文、タイトル、cwdは含めません。認証情報はAuthorizationヘッダーに使われ、利用可能な場合はChatGPT-Account-Idもヘッダーに含まれます。credential storeをSessionGaugeが直接解析・保存せず、raw responseやcredentialをログ・永続化しません。
 
-このopt-in機能は外部ネットワークを使います。通常のローカル収集はネットワーク送信をしません。quota値はmonitor DBやexportへ保存しません。詳細な制約は[既知の制限](known-limitations.md)を参照してください。
+このopt-in機能は外部ネットワークを使います。通常のローカル収集はネットワーク送信をしません。API response・window context・推定値はmonitor DBやexportへ保存しません。履歴DBは読み取り専用で参照します。詳細な制約は[既知の制限](known-limitations.md)を参照してください。
 
 ブリッジには `.env` / `.ssh` へのファイルアクセスを拒否する監査ガードがあります。これは補助的なプロセス内ガードであり、OS sandboxではありません。Hermes SDKが相対パスでファイルを開く構成では照会が失敗し、quotaは `N/A` になります。
 
