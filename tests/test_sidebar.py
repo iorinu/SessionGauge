@@ -315,6 +315,7 @@ def test_quota_failure_keeps_numeric_metadata_and_adds_na():
         quota_reader=Quota(),
         runner=runner,
         adapter=Adapter(),
+        wall_clock=lambda: 1,
         display="percent_tokens",
     )
     reporter.publish(
@@ -802,6 +803,7 @@ def test_default_percent_only(quota_value, expected):
         quota_reader=Quota(),
         runner=runner,
         adapter=Adapter(),
+        wall_clock=lambda: 1,
     )
     reporter.publish(
         {
@@ -851,3 +853,45 @@ def test_default_percent_only_is_na_without_eligible_quota(quota_enabled, profil
     reporter.publish({"panes": [row]})
     write = next(command for command in runner.commands if "--token" in command)
     assert write[write.index("--token") + 1] == "sessiongauge_usage=N/A"
+
+
+def test_estimate_mode_formats_estimated_percent_without_window_claim():
+    from concurrent.futures import Future
+
+    home = Path("~/.hermes").expanduser()
+    profile = str(uuid.uuid5(uuid.NAMESPACE_URL, str((home / "state.db").resolve())))
+
+    class Quota:
+        def read_session_metadata(self, threads):
+            return {}
+
+    runner = Runner()
+    reporter = SidebarReporter(
+        enabled=True,
+        quota_enabled=True,
+        quota_mode="estimate",
+        quota_reader=Quota(),
+        runner=runner,
+        adapter=Adapter(),
+        wall_clock=lambda: 1,
+    )
+    context = {"sid": "s", "tokens": 1000, "model": "gpt-x", "profile": reporter.quota_profile_id}
+    future = Future()
+    future.set_result({"s": {"percent": 10, "data_as_of": 1}})
+    reporter._quota_future = future
+    reporter._quota_future_context = {("endpoint", "p1", "t1"): context}
+    data = {
+        "panes": [
+            {
+                "pane_id": "p1",
+                "terminal_id": "t1",
+                "status": "matched",
+                "profile": profile,
+                "session": {"id": "s", "total_tokens": 1500, "model": "gpt-x"},
+            }
+        ]
+    }
+    reporter.publish(data)
+    write = next(command for command in runner.commands if "--token" in command)
+    assert write[write.index("--token") + 1] == "sessiongauge_usage=~15%"
+    reporter.close()

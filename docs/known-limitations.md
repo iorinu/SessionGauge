@@ -12,11 +12,11 @@ SessionGaugeが示すのはローカルで観測できた値です。欠損期�
 
 ## quota表示
 
-- 表示値はAPIが返す `five_hour_limit_percent` のbudget換算割合です。「現在の5時間windowだけ」の使用率と確認されたものではなく、token数やアカウント全体の残量でもありません。100%超もそのまま表示します。
-- 利用可能な値だけを表示します。部分データ、欠損、無効な数値、照会失敗、未対応SIDは `N/A` です。token数や別SID・アカウント全体の値で埋めません。
+- `api` modeはAPIが返す `five_hour_limit_percent` のbudget換算割合を表示します。「現在の5時間windowだけ」の使用率と確認されたものではなく、token数やアカウント全体の残量でもありません。100%超もそのまま表示します。
+- `estimate` modeではAPI割合と取得時点のローカルトークンを校正に使った近似を表示します。時点差や集計期間未確認による誤差を許容し、推定は `~` で示します。現在windowの割合やtoken上限を保証しません。校正不能・失効時は `N/A` です。
 - native APIは一度に最大100件のroot threadを照会します。対象が101件以上なら全対象が `N/A` になります。子threadの利用量は合算しません。
 - 対象はquota設定の `hermes_home` に対応するprofileの、一意に照合できたSIDです。他profile、quota無効時にはquotaを取得しません。割合のみ表示が既定で、旧token数との併記は `percent_tokens` を明示した場合だけです。
-- 照会間隔は既定60秒、設定範囲30〜3600秒です。SID別の値はメモリ内に保持しますが、poll間隔はbatch全体に適用されます。新SIDは次batchまでpendingの `N/A` となり、batch失敗時はcacheを消去して次のintervalで再試行します。即時retryはしません。
+- 照会間隔は既定60秒、設定範囲30〜3600秒です。推定校正は既定86400秒で失効し、プロセス内だけに保持します。再起動後は再校正が必要です。`estimate` modeのAPI照会は背景処理で行うため、初回は応答を待たず `N/A` となり得ます。
 - quotaは外部APIへのopt-in照会で、monitor DBやexportには保存しません。認証・送信データの範囲は[アーキテクチャ](architecture.md)を参照してください。
 
 ## sidebarと動作環境
