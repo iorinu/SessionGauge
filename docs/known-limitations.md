@@ -7,6 +7,7 @@ SessionGaugeが示すのはローカルで観測できた値です。欠損期�
 - **baselineと期間集計**: 初回に読んだ累計値はbaselineです。導入前の日別・期間別使用量は復元できません。
 - **観測時点**: 使用量はHermes DBへの書き込み後のpollで更新されます。生成中の逐次token計測ではありません。`recent_60s` は直近60秒内に終了した観測区間の差分で、実時間の速度や発生時刻を示しません。
 - **期間境界**: 指定期間やローカル午前0時をまたぐ区間を按分せず除外する場合があります。history/exportはlower boundになり得ます。
+- **集約status**: グループ内に帰属済み・未帰属の記録が混在する場合、グループの `mapping_status` は `mixed` です。各記録のstatusは個別に保持します。
 - **Taskとprofile**: 正確なherdr Session ID、保存済み関係、明示リンクがない限りTaskに割り当てません。profile間ID衝突、複数Pane競合、session再開、Pane移動、圧縮・分岐では誤帰属を避け、`unlinked` / `unattributed` とする場合があります。
 - **modelとcost**: セッション累計のmodelを区間のbest-known値として使うため、途中でmodelが変わった場合に正確なmodel別配分はできません。actual costが提供されない場合は `N/A` で、請求額との一致を保証しません。
 

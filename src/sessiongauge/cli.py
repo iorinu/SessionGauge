@@ -591,8 +591,8 @@ def _show(config, identifier):
         if session:
             links = named(
                 db.connection.execute(
-                    "SELECT endpoint,pane_id,terminal_id,profile_id,session_id,valid_from,valid_to,source,confidence FROM pane_session_links WHERE session_id=? ORDER BY valid_from",
-                    (identifier,),
+                    "SELECT endpoint,pane_id,terminal_id,profile_id,session_id,valid_from,valid_to,source,confidence FROM pane_session_links WHERE profile_id=? AND session_id=? ORDER BY valid_from",
+                    (session[0]["profile_id"], identifier),
                 )
             )
         events = named(
@@ -621,7 +621,7 @@ def _show(config, identifier):
         )
         lineage = {}
         for item in task_sessions:
-            lineage[item["session_id"]] = item
+            lineage[(item["profile_id"], item["session_id"])] = item
         for item in list(task_sessions):
             if item["parent_session_id"]:
                 parent = named(
@@ -631,16 +631,26 @@ def _show(config, identifier):
                     )
                 )
                 if parent:
-                    lineage[parent[0]["session_id"]] = parent[0]
-        for parent_id in tuple(lineage):
+                    lineage[(parent[0]["profile_id"], parent[0]["session_id"])] = parent[0]
+        for profile_id, parent_id in tuple(lineage):
             for child in named(
                 db.connection.execute(
-                    "SELECT profile_id,session_id,parent_session_id,model,title FROM session_catalog WHERE parent_session_id=?",
-                    (parent_id,),
+                    "SELECT profile_id,session_id,parent_session_id,model,title FROM session_catalog WHERE profile_id=? AND parent_session_id=?",
+                    (profile_id, parent_id),
                 )
             ):
-                lineage[child["session_id"]] = child
+                lineage[(child["profile_id"], child["session_id"])] = child
         name_events = []
+        candidate_links = named(
+            db.connection.execute(
+                "SELECT endpoint,pane_id,terminal_id,profile_id,session_id,valid_from,valid_to,source,confidence FROM pane_session_links"
+            )
+        )
+        known_panes = named(
+            db.connection.execute(
+                "SELECT endpoint,pane_id,terminal_id,first_seen,last_seen FROM panes"
+            )
+        )
         for row in db.connection.execute(
             "SELECT at,kind,detail FROM events WHERE kind='pane_title_changed' ORDER BY at"
         ):
@@ -649,10 +659,42 @@ def _show(config, identifier):
             except (ValueError, TypeError):
                 continue
             if isinstance(detail, dict) and "old_title" in detail and "new_title" in detail:
+                pane_id = detail.get("pane_id")
+                has_identity = "endpoint" in detail and "terminal_id" in detail
+                eligible_links = [
+                    link
+                    for link in candidate_links
+                    if link["pane_id"] == pane_id
+                    and link["valid_from"] <= row[0]
+                    and (link["valid_to"] is None or row[0] < link["valid_to"])
+                    and (
+                        not has_identity
+                        or (link["endpoint"], link["terminal_id"])
+                        == (detail["endpoint"], detail["terminal_id"])
+                    )
+                ]
+                if len(eligible_links) != 1:
+                    continue
+                if eligible_links[0] not in links:
+                    continue
+                if not has_identity:
+                    # 旧形式は、未リンクのpaneも含めて世代を一意に決められる場合だけ採用する。
+                    generations = {
+                        (item["endpoint"], item["pane_id"], item["terminal_id"])
+                        for item in eligible_links
+                    }
+                    generations.update(
+                        (item["endpoint"], item["pane_id"], item["terminal_id"])
+                        for item in known_panes
+                        if item["pane_id"] == pane_id
+                        and item["first_seen"] <= row[0] <= item["last_seen"]
+                    )
+                    if len(generations) != 1:
+                        continue
                 name_events.append(
                     {
                         "at": row[0],
-                        "pane_id": detail.get("pane_id"),
+                        "pane_id": pane_id,
                         "old_title": detail["old_title"],
                         "new_title": detail["new_title"],
                     }
@@ -678,15 +720,11 @@ def _show(config, identifier):
 
 
 def _link(config, args):
-    paths = []
-    for candidate in config.hermes_db_paths:
-        canonical = str(candidate.expanduser().resolve(strict=False))
-        profile_id = uuid.uuid5(uuid.NAMESPACE_URL, canonical)
-        profile_name = (
-            candidate.parent.name if candidate.parent.parent.name == "profiles" else "default"
-        )
-        if args.profile is None or args.profile in (profile_name, str(profile_id), canonical):
-            paths.append(candidate)
+    paths = (
+        config.hermes_db_paths
+        if args.profile is None
+        else _select_profiles(config.hermes_db_paths, args.profile)
+    )
     if args.profile and not paths:
         raise ValueError("profile not found")
     containing = []

@@ -7,6 +7,7 @@ import subprocess
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Lock
 
 
 class TokenQuotaEstimator:
@@ -113,7 +114,10 @@ class QuotaReader:
         self.agent_resume_bin = agent_resume_bin
         self.hermes_home = hermes_home
         self.poll_interval_seconds = poll_interval_seconds
-        self.runner = runner or subprocess.run
+        self.runner = runner or self._run_owned
+        self._lock = Lock()
+        self._closed = False
+        self._children = set()
         self.clock = clock or time.monotonic
         self.hermes_root = str(Path(hermes_root).expanduser())
         self.hermes_python = (
@@ -131,6 +135,67 @@ class QuotaReader:
         self._last_metadata_poll = None
         self._cached = None
         self._sessions_cached = {}
+
+    @staticmethod
+    def _stop_child(child):
+        """所有する子だけを停止し、各待機に上限を設ける。"""
+        if child.poll() is not None:
+            return
+        try:
+            child.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            child.wait(timeout=0.25)
+        except subprocess.TimeoutExpired:
+            try:
+                child.kill()
+            except ProcessLookupError:
+                pass
+            child.wait(timeout=1)
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            self._cached = None
+            self._sessions_cached = {}
+            children = tuple(self._children)
+        for child in children:
+            self._stop_child(child)
+
+    def _run_owned(self, args, *, capture_output, text, timeout, check, input=None, **kwargs):
+        with self._lock:
+            if self._closed:
+                raise subprocess.SubprocessError("quota reader is closed")
+        # 起動中のcloseも、登録時に再確認して取りこぼさない。
+        if input is not None:
+            kwargs["stdin"] = subprocess.PIPE
+        child = subprocess.Popen(
+            args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=text, **kwargs
+        )
+        with self._lock:
+            self._children.add(child)
+            closed = self._closed
+        try:
+            if closed:
+                raise subprocess.SubprocessError("quota reader is closed")
+            stdout, stderr = child.communicate(input=input, timeout=timeout)
+            return subprocess.CompletedProcess(args, child.returncode, stdout, stderr)
+        finally:
+            # communicateの例外経路でも停止・回収する。I/O中は状態lockを保持しない。
+            self._stop_child(child)
+            for name in ("stdin", "stdout", "stderr"):
+                stream = getattr(child, name, None)
+                if stream is not None:
+                    stream.close()
+            with self._lock:
+                self._children.discard(child)
+
+    def _request(self, *args, **kwargs):
+        with self._lock:
+            if self._closed:
+                raise subprocess.SubprocessError("quota reader is closed")
+        return self.runner(*args, **kwargs)
 
     @staticmethod
     def _detect_helper(binary):
@@ -160,17 +225,20 @@ class QuotaReader:
             for t in threads
         ):
             return {}
-        if (
-            self._last_sessions_poll is not None
-            and now - self._last_sessions_poll < self.poll_interval_seconds
-        ):
-            return {sid: value for sid, value in self._sessions_cached.items() if sid in ids}
-        self._last_sessions_poll = now
-        self._sessions_cached = {}
+        with self._lock:
+            if self._closed:
+                return {}
+            if (
+                self._last_sessions_poll is not None
+                and now - self._last_sessions_poll < self.poll_interval_seconds
+            ):
+                return {sid: value for sid, value in self._sessions_cached.items() if sid in ids}
+            self._last_sessions_poll = now
+            self._sessions_cached = {}
         if not self.auth_helper or not Path(self.auth_helper).is_file():
             return {}
         try:
-            result = self.runner(
+            result = self._request(
                 [
                     self.hermes_python,
                     str(Path(__file__).with_name("hermes_usage_bridge.py")),
@@ -219,10 +287,13 @@ class QuotaReader:
                     continue
                 if math.isfinite(numeric):
                     output[sid] = numeric
-            self._sessions_cached = output
+            with self._lock:
+                if self._closed:
+                    return {}
+                self._sessions_cached = output
+                return dict(output)
         except (OSError, subprocess.SubprocessError, ValueError, TypeError, OverflowError):
-            self._sessions_cached = {}
-        return dict(self._sessions_cached)
+            return {}
 
     def read_session_metadata(self, threads):
         """校正用metadata読取。legacy read_sessionsとは別の明示flagを使う。"""
@@ -244,16 +315,17 @@ class QuotaReader:
         ):
             return {}
         now = self.clock()
-        if (
-            self._last_metadata_poll is not None
-            and now - self._last_metadata_poll < self.poll_interval_seconds
-        ):
-            return {}
-        self._last_metadata_poll = now
+        with self._lock:
+            if self._closed or (
+                self._last_metadata_poll is not None
+                and now - self._last_metadata_poll < self.poll_interval_seconds
+            ):
+                return {}
+            self._last_metadata_poll = now
         if not self.auth_helper or not Path(self.auth_helper).is_file():
             return {}
         try:
-            result = self.runner(
+            result = self._request(
                 [
                     self.hermes_python,
                     str(Path(__file__).with_name("hermes_usage_bridge.py")),
@@ -303,7 +375,8 @@ class QuotaReader:
                 if as_of > datetime.now(UTC).timestamp():
                     continue
                 output[row["thread_id"]] = {"percent": float(value), "data_as_of": as_of}
-            return output
+            with self._lock:
+                return {} if self._closed else output
         except (OSError, subprocess.SubprocessError, ValueError, TypeError, OverflowError):
             return {}
 
@@ -318,12 +391,15 @@ class QuotaReader:
 
     def read(self):
         now = self.clock()
-        if self._last_poll is not None and now - self._last_poll < self.poll_interval_seconds:
-            return self._cached
-        self._last_poll = now
-        self._cached = None
+        with self._lock:
+            if self._closed:
+                return None
+            if self._last_poll is not None and now - self._last_poll < self.poll_interval_seconds:
+                return self._cached
+            self._last_poll = now
+            self._cached = None
         try:
-            result = self.runner(
+            result = self._request(
                 [
                     self.agent_resume_bin,
                     "usage",
@@ -359,7 +435,10 @@ class QuotaReader:
                 return None
             if not math.isfinite(value) or not 0 <= value <= 100:
                 return None
-            self._cached = value
-            return value
+            with self._lock:
+                if self._closed:
+                    return None
+                self._cached = value
+                return value
         except (OSError, subprocess.SubprocessError, ValueError, TypeError, OverflowError):
             return None

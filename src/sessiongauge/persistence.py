@@ -5,6 +5,7 @@ import os
 import sqlite3
 import uuid
 from pathlib import Path
+from urllib.parse import quote
 
 from sessiongauge.accounting import counter_deltas
 from sessiongauge.domain import Counters
@@ -80,13 +81,14 @@ class MonitorDB:
             raise
 
     def _is_monitor_database(self):
+        probe = None
         try:
-            probe = sqlite3.connect(f"file:{self.path.resolve()}?mode=ro", uri=True)
+            uri = f"file:{quote(str(self.path.resolve()), safe='/')}?mode=ro"
+            probe = sqlite3.connect(uri, uri=True)
             version = probe.execute("PRAGMA user_version").fetchone()[0]
             tables = {
                 r[0] for r in probe.execute("SELECT name FROM sqlite_master WHERE type='table'")
             }
-            probe.close()
             return (
                 version == 0
                 and not tables
@@ -99,6 +101,9 @@ class MonitorDB:
             )
         except sqlite3.Error:
             return False
+        finally:
+            if probe is not None:
+                probe.close()
 
     def __exit__(self, *_):
         if self.connection:
@@ -338,18 +343,19 @@ class MonitorDB:
                     "INSERT OR IGNORE INTO tasks(task_id,display_name,project_path,created_at) VALUES(?,?,?,?)",
                     (task_id, pane.title, pane.cwd, collected_at),
                 )
-                c.execute(
-                    "INSERT OR IGNORE INTO pane_session_links(endpoint,pane_id,terminal_id,task_id,profile_id,session_id,valid_from,source,confidence) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (
-                        *pane.generation_key,
-                        task_id,
-                        profile,
-                        sid,
-                        collected_at,
-                        "official",
-                        "exact",
-                    ),
-                )
+                if not existing or existing[1:] != (profile, sid):
+                    c.execute(
+                        "INSERT INTO pane_session_links(endpoint,pane_id,terminal_id,task_id,profile_id,session_id,valid_from,source,confidence) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (
+                            *pane.generation_key,
+                            task_id,
+                            profile,
+                            sid,
+                            collected_at,
+                            "official",
+                            "exact",
+                        ),
+                    )
                 pane_key = "|".join(str(x) for x in pane.generation_key)
                 link = c.execute(
                     "SELECT task_id FROM task_pane_links WHERE pane_key=? AND valid_to IS NULL",
@@ -451,13 +457,35 @@ class MonitorDB:
             previous = c.execute(
                 "SELECT title FROM panes WHERE endpoint=? AND pane_id=? AND terminal_id IS ?", key
             ).fetchone()
-            c.execute(
-                "INSERT INTO panes VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(endpoint,pane_id,terminal_id) DO UPDATE SET title=excluded.title,cwd=excluded.cwd,last_seen=excluded.last_seen,status=excluded.status",
-                (*key, pane.title, pane.cwd, None, collected_at, collected_at, pane.agent_status),
-            )
+            if previous:
+                c.execute(
+                    "UPDATE panes SET title=?,cwd=?,last_seen=?,status=? WHERE endpoint=? AND pane_id=? AND terminal_id IS ?",
+                    (pane.title, pane.cwd, collected_at, pane.agent_status, *key),
+                )
+            else:
+                c.execute(
+                    "INSERT INTO panes SELECT ?,?,?,?,?,?,?,?,? WHERE NOT EXISTS "
+                    "(SELECT 1 FROM panes WHERE endpoint=? AND pane_id=? AND terminal_id IS ?)",
+                    (
+                        *key,
+                        pane.title,
+                        pane.cwd,
+                        None,
+                        collected_at,
+                        collected_at,
+                        pane.agent_status,
+                        *key,
+                    ),
+                )
             if previous and previous[0] != pane.title:
                 detail = json.dumps(
-                    {"pane_id": pane.pane_id, "old_title": previous[0], "new_title": pane.title},
+                    {
+                        "endpoint": pane.endpoint,
+                        "pane_id": pane.pane_id,
+                        "terminal_id": pane.terminal_id,
+                        "old_title": previous[0],
+                        "new_title": pane.title,
+                    },
                     ensure_ascii=False,
                 )
                 c.execute(
@@ -496,20 +524,38 @@ class MonitorDB:
                 "INSERT OR IGNORE INTO tasks(task_id,display_name,project_path,created_at) VALUES(?,?,?,?)",
                 (task_id, pane.title, pane.cwd, now),
             )
-            c.execute(
-                "INSERT INTO panes VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(endpoint,pane_id,terminal_id) DO UPDATE SET title=excluded.title,cwd=excluded.cwd,last_seen=excluded.last_seen,status=excluded.status",
-                (
-                    pane.endpoint,
-                    pane.pane_id,
-                    pane.terminal_id,
-                    pane.title,
-                    pane.cwd,
-                    None,
-                    now,
-                    now,
-                    pane.agent_status,
-                ),
-            )
+            previous_pane = c.execute(
+                "SELECT 1 FROM panes WHERE endpoint=? AND pane_id=? AND terminal_id IS ?",
+                (pane.endpoint, pane.pane_id, pane.terminal_id),
+            ).fetchone()
+            if previous_pane:
+                c.execute(
+                    "UPDATE panes SET title=?,cwd=?,last_seen=?,status=? WHERE endpoint=? AND pane_id=? AND terminal_id IS ?",
+                    (
+                        pane.title,
+                        pane.cwd,
+                        now,
+                        pane.agent_status,
+                        pane.endpoint,
+                        pane.pane_id,
+                        pane.terminal_id,
+                    ),
+                )
+            else:
+                c.execute(
+                    "INSERT INTO panes VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        pane.endpoint,
+                        pane.pane_id,
+                        pane.terminal_id,
+                        pane.title,
+                        pane.cwd,
+                        None,
+                        now,
+                        now,
+                        pane.agent_status,
+                    ),
+                )
             c.execute(
                 "INSERT INTO pane_session_links(endpoint,pane_id,terminal_id,task_id,profile_id,session_id,valid_from,source,confidence) VALUES(?,?,?,?,?,?,?,?,?)",
                 (

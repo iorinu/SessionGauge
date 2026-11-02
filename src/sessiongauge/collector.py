@@ -336,8 +336,7 @@ class Collector:
                     "pane_id": item.pane.pane_id,
                     "terminal_id": item.pane.terminal_id,
                     "status": item.status,
-                    "task_id": active_task
-                    or (row_owners.get(item.session_id) if item.status == "matched" else None),
+                    "task_id": active_task,
                     "session": row.as_dict() if row else None,
                     "title": item.pane.title,
                     "cwd": item.pane.cwd,
