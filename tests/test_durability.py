@@ -188,7 +188,13 @@ def test_pane_title_event_includes_old_and_new_json_values(tmp_path):
         )
         kind, detail = db.connection.execute("SELECT kind,detail FROM events").fetchone()
         assert kind == "pane_title_changed"
-        assert json.loads(detail) == {"pane_id": "pane-1", "old_title": "old", "new_title": "new"}
+        assert json.loads(detail) == {
+            "endpoint": "local",
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "old_title": "old",
+            "new_title": "new",
+        }
 
 
 def test_source_values_are_sanitized_and_source_file_remains_unchanged(tmp_path):

@@ -10,6 +10,7 @@ import time
 import unicodedata
 from dataclasses import dataclass, replace
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 
@@ -365,9 +366,10 @@ def render_frame(data, state, width=80, now=None, height=None, config=None):
 def _worker(config, collector_factory, messages, stop, refresh, interval, profile):
     collector = None
     try:
-        collector = collector_factory(config)
         while not stop.is_set():
             try:
+                if collector is None:
+                    collector = collector_factory(config)
                 data = collector.collect()
                 # monitor接続はCollectorを所有するこのワーカー内でのみ参照する。
                 monitor = getattr(collector, "monitor", None)
@@ -379,12 +381,27 @@ def _worker(config, collector_factory, messages, stop, refresh, interval, profil
                         LEFT JOIN pane_session_links l ON l.task_id=t.task_id AND l.profile_id=c.profile_id AND l.session_id=c.session_id
                         LEFT JOIN snapshots s ON s.profile_id=c.profile_id AND s.session_id=c.session_id AND s.collected_at=(SELECT MAX(z.collected_at) FROM snapshots z WHERE z.profile_id=c.profile_id AND z.session_id=c.session_id)
                         """).fetchall()
+                    allowed_profiles = None
+                    if config is not None and hasattr(config, "hermes_db_paths"):
+                        canonical_paths = {
+                            str(Path(path).expanduser().resolve(strict=False))
+                            for path in config.hermes_db_paths
+                        }
+                        allowed_profiles = {
+                            row[0]
+                            for row in monitor.connection.execute(
+                                "SELECT id,db_path FROM profiles"
+                            ).fetchall()
+                            if row[1] in canonical_paths
+                        }
                     existing = {
                         (p.get("profile"), (p.get("session") or {}).get("id"))
                         for p in data.get("panes", [])
                     }
                     for r in known:
                         profile_id, session_id = r[0], r[1]
+                        if allowed_profiles is not None and profile_id not in allowed_profiles:
+                            continue
                         if (profile_id, session_id) in existing:
                             continue
                         data.setdefault("panes", []).append(

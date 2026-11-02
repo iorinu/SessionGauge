@@ -1,7 +1,7 @@
 """Observed usage history, derived only from persisted attribution intervals."""
 
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sessiongauge.persistence import MonitorDB
 
@@ -27,13 +27,13 @@ def _zone(name):
     if tz:
         try:
             return ZoneInfo(tz)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, ZoneInfoNotFoundError):
             pass
     localtime = Path("/etc/localtime")
     try:
         resolved = str(localtime.resolve()).split("/zoneinfo/", 1)[1]
         return ZoneInfo(resolved)
-    except (OSError, IndexError, ValueError):
+    except (OSError, IndexError, ValueError, ZoneInfoNotFoundError):
         return datetime.now().astimezone().tzinfo
 
 
@@ -146,6 +146,8 @@ def history(
                 notes.append("Some counter values are unavailable; totals are partial/N/A.")
             if e["estimated_cost_usd"] is None or e["actual_cost_usd"] is None:
                 notes.append("Some cost values are unavailable; reported costs are partial/N/A.")
+            if e["mapping_status"] != target["mapping_status"]:
+                target["mapping_status"] = "mixed"
             target["records"].append(e)
         for target in grouped.values():
             target["notes"] = list(dict.fromkeys(notes))
