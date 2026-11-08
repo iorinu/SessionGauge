@@ -9,6 +9,187 @@ from sessiongauge.persistence import MonitorDB
 from sessiongauge.tui import TUIState, _worker, handle_key, render_frame
 
 
+@pytest.mark.parametrize("owned_child", [False, True])
+def test_tui_quit_cancels_blocked_synchronous_quota(tmp_path, monkeypatch, owned_child):
+    from test_sidebar import Adapter, Runner
+
+    from sessiongauge import cli, quota, sidebar, tui
+    from sessiongauge.config import Config
+
+    entered, release, cancelled, closed = (threading.Event() for _ in range(4))
+    errors, owners = [], []
+    runner = Runner()
+    home = tmp_path / "quota-home"
+    helper = tmp_path / "helper"
+    helper.touch()
+    config = Config(
+        sidebar_enabled=True,
+        sidebar_quota_enabled=True,
+        sidebar_quota_mode="api",
+        sidebar_quota_hermes_home=home,
+        sidebar_quota_auth_helper=helper,
+    )
+    children = []
+
+    class Child:
+        returncode = None
+
+        def __init__(self, *args, **kwargs):
+            children.append(self)
+
+        def communicate(self, **kwargs):
+            entered.set()
+            assert release.wait(3)
+            return '{"threads":[]}', ""
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+            cancelled.set()
+            release.set()
+
+        def wait(self, timeout):
+            assert 0 < timeout <= 1
+            assert self.returncode is not None
+            return self.returncode
+
+    class Reader:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def read_sessions(self, threads):
+            entered.set()
+            assert release.wait(3), "テストの読取待機が解除されなかった"
+            return {"s": 12}
+
+        def close(self):
+            cancelled.set()
+            release.set()
+
+    real_reporter = sidebar.SidebarReporter
+
+    def reporter_factory(**kwargs):
+        reporter = real_reporter(**kwargs, runner=runner, adapter=Adapter())
+        owners.append(reporter)
+        return reporter
+
+    class Collector:
+        def __init__(self, config):
+            self.owner = threading.get_ident()
+            self.monitor = MonitorDB(tmp_path / "monitor.db").__enter__()
+            self.herdr_state = SimpleNamespace(last_success=Adapter().list_panes())
+
+        def collect(self):
+            return {
+                "panes": [
+                    {
+                        "pane_id": "p1",
+                        "terminal_id": "t1",
+                        "status": "matched",
+                        "profile": owners[0].quota_profile_id,
+                        "session": {"id": "s", "total_tokens": 100},
+                    }
+                ]
+            }
+
+        def close(self):
+            assert threading.get_ident() == self.owner
+            self.monitor.connection.execute("SELECT 1")
+            self.monitor.__exit__()
+            closed.set()
+
+    class Screen:
+        def nodelay(self, value):
+            pass
+
+        def getmaxyx(self):
+            return 24, 100
+
+        def erase(self):
+            pass
+
+        def addnstr(self, *args):
+            pass
+
+        def refresh(self):
+            pass
+
+        def getch(self):
+            assert entered.wait(2)
+            return ord("q")
+
+    monkeypatch.setattr(cli, "Collector", Collector)
+    if owned_child:
+        monkeypatch.setattr(quota.subprocess, "Popen", Child)
+    else:
+        monkeypatch.setattr(quota, "QuotaReader", Reader)
+    monkeypatch.setattr(sidebar, "SidebarReporter", reporter_factory)
+
+    def run():
+        try:
+            tui.run_tui(config, cli._sidebar_factory(config), screen_runner=lambda ui: ui(Screen()))
+        except (AssertionError, RuntimeError, OSError, sqlite3.Error) as exc:
+            errors.append(exc)
+
+    ui_thread = threading.Thread(target=run)
+    ui_thread.start()
+    try:
+        assert entered.wait(2)
+        assert cancelled.wait(1), "quit did not cancel the blocked quota reader"
+        assert closed.wait(1), "worker did not close its own SQLite connection"
+    finally:
+        release.set()
+        ui_thread.join(12)
+    assert not ui_thread.is_alive()
+    assert not errors
+    assert all(child.poll() is not None for child in children)
+    if owned_child:
+        assert len(children) == 1
+        assert not owners[0].quota_reader._children
+    assert not [cmd for cmd in runner.commands if "--token" in cmd or "--clear-token" in cmd]
+
+
+def test_quit_during_collector_creation_cancels_before_collect():
+    from sessiongauge.tui import _WorkerLifecycle
+
+    entered, release = threading.Event(), threading.Event()
+    events = []
+    lifecycle = _WorkerLifecycle()
+
+    class Collector:
+        def cancel(self):
+            events.append("cancel")
+
+        def collect(self):
+            events.append("collect")
+
+        def close(self):
+            events.append("close")
+
+    def factory(config):
+        entered.set()
+        assert release.wait(2)
+        return Collector()
+
+    stop = threading.Event()
+    worker = threading.Thread(
+        target=_worker,
+        args=(None, factory, queue.Queue(), stop, threading.Event(), 1, None, lifecycle),
+    )
+    worker.start()
+    try:
+        assert entered.wait(1)
+        stop.set()
+        lifecycle.cancel()
+    finally:
+        release.set()
+        worker.join(2)
+    assert not worker.is_alive()
+    assert events == ["cancel", "close"]
+
+
 def test_worker_limits_historical_sessions_to_configured_profiles(tmp_path):
     selected_path = tmp_path / "selected" / "state.db"
     excluded_path = tmp_path / "excluded" / "state.db"

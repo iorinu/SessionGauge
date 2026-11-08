@@ -377,6 +377,10 @@ def _sidebar_factory(config):
                 finally:
                     collector.close()
 
+            def cancel(self):
+                # UIスレッドからはquotaだけを停止し、SQLiteのcloseはワーカーに任せる。
+                reporter.cancel()
+
         return ReportingCollector()
 
     return factory
@@ -643,7 +647,7 @@ def _show(config, identifier):
         name_events = []
         candidate_links = named(
             db.connection.execute(
-                "SELECT endpoint,pane_id,terminal_id,profile_id,session_id,valid_from,valid_to,source,confidence FROM pane_session_links"
+                "SELECT endpoint,pane_id,terminal_id,profile_id,session_id,valid_from,valid_to,source,confidence,task_id FROM pane_session_links"
             )
         )
         known_panes = named(
@@ -673,9 +677,27 @@ def _show(config, identifier):
                         == (detail["endpoint"], detail["terminal_id"])
                     )
                 ]
-                if len(eligible_links) != 1:
+                # 行の重複ではなく、世代と所有者の組が一意かを判定する。
+                owners = {
+                    tuple(
+                        link[key]
+                        for key in (
+                            "endpoint",
+                            "pane_id",
+                            "terminal_id",
+                            "task_id",
+                            "profile_id",
+                            "session_id",
+                        )
+                    )
+                    for link in eligible_links
+                }
+                if len(owners) != 1:
                     continue
-                if eligible_links[0] not in links:
+                if not any(
+                    {key: value for key, value in link.items() if key != "task_id"} in links
+                    for link in eligible_links
+                ):
                     continue
                 if not has_identity:
                     # 旧形式は、未リンクのpaneも含めて世代を一意に決められる場合だけ採用する。

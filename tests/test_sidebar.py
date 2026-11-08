@@ -1,4 +1,5 @@
 import json
+import threading
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -130,6 +131,186 @@ def test_silent_success_owns_token_and_clears_it_on_close(stdout):
     assert len(clears) == 1
     write = next(command for command in runner.commands if "--token" in command)
     assert int(clears[0][clears[0].index("--seq") + 1]) > int(write[write.index("--seq") + 1])
+
+
+def test_cancel_does_not_wait_for_metadata_send_and_close_clears_after_it():
+    entered, release = threading.Event(), threading.Event()
+    commands = []
+    base = Runner()
+
+    def runner(args, **kwargs):
+        commands.append(args)
+        if args[-1:] == ["--help"] or args[-2:] == ["schema", "--json"]:
+            return base(args, **kwargs)
+        if "--token" in args:
+            entered.set()
+            assert release.wait(5)
+        return SimpleNamespace(returncode=0, stdout='{"result":{"type":"ok"}}', stderr="")
+
+    reporter = SidebarReporter(enabled=True, runner=runner, adapter=Adapter())
+    data = {
+        "panes": [
+            {
+                "pane_id": "p1",
+                "terminal_id": "t1",
+                "status": "matched",
+                "session": {"id": "s", "total_tokens": 42},
+            }
+        ]
+    }
+    worker = threading.Thread(target=reporter.publish, args=(data,))
+    worker.start()
+    try:
+        assert entered.wait(1)
+        cancelled = threading.Event()
+        cancel_thread = threading.Thread(target=lambda: (reporter.cancel(), cancelled.set()))
+        cancel_thread.start()
+        assert cancelled.wait(0.2), "cancel waited for the in-flight metadata send"
+        closer = threading.Thread(target=reporter.close)
+        closer.start()
+        assert closer.is_alive(), "close must wait behind the in-flight send before clearing"
+    finally:
+        release.set()
+        worker.join(2)
+        if "closer" in locals():
+            closer.join(2)
+    writes = [cmd for cmd in commands if "--token" in cmd]
+    clears = [cmd for cmd in commands if "--clear-token" in cmd]
+    assert len(writes) == len(clears) == 1
+    assert int(clears[0][clears[0].index("--seq") + 1]) > int(
+        writes[0][writes[0].index("--seq") + 1]
+    )
+
+
+def test_close_cannot_miss_ownership_between_send_and_assignment():
+    sent, release = threading.Event(), threading.Event()
+    runner = Runner()
+    reporter = SidebarReporter(enabled=True, runner=runner, adapter=Adapter())
+    send = reporter._send
+
+    def blocked_send(*args, **kwargs):
+        result = send(*args, **kwargs)
+        if kwargs.get("token") is not None:
+            sent.set()
+            assert release.wait(5)
+        return result
+
+    reporter._send = blocked_send
+    data = {
+        "panes": [
+            {
+                "pane_id": "p1",
+                "terminal_id": "t1",
+                "status": "matched",
+                "session": {"id": "s", "total_tokens": 42},
+            }
+        ]
+    }
+    worker = threading.Thread(target=reporter.publish, args=(data,))
+    worker.start()
+    try:
+        assert sent.wait(1)
+        closer = threading.Thread(target=reporter.close)
+        closer.start()
+        closer.join(0.05)
+        assert closer.is_alive(), "close must wait until send ownership is recorded"
+    finally:
+        release.set()
+        worker.join(2)
+        if "closer" in locals():
+            closer.join(2)
+
+    clears = [command for command in runner.commands if "--clear-token" in command]
+    assert len(clears) == 1
+    assert reporter._owned == {}
+
+
+def test_close_cancels_publish_paused_before_send():
+    started, cancelled, release = threading.Event(), threading.Event(), threading.Event()
+    runner = Runner()
+    reporter = SidebarReporter(enabled=True, runner=runner, adapter=Adapter())
+    send = reporter._send
+
+    def blocked_send(*args, **kwargs):
+        if kwargs.get("token") is not None:
+            started.set()
+            assert release.wait(5)
+        return send(*args, **kwargs)
+
+    reporter._send = blocked_send
+    cancel = reporter.cancel
+
+    def signal_cancel():
+        cancel()
+        cancelled.set()
+
+    reporter.cancel = signal_cancel
+    data = {
+        "panes": [
+            {
+                "pane_id": "p1",
+                "terminal_id": "t1",
+                "status": "matched",
+                "session": {"id": "s", "total_tokens": 42},
+            }
+        ]
+    }
+    worker = threading.Thread(target=reporter.publish, args=(data,))
+    worker.start()
+    closer = None
+    try:
+        assert started.wait(1)
+        closer = threading.Thread(target=reporter.close)
+        closer.start()
+        assert cancelled.wait(1)
+    finally:
+        release.set()
+        worker.join(2)
+        if closer is not None:
+            closer.join(2)
+    assert not worker.is_alive()
+    assert closer is not None and not closer.is_alive()
+
+    assert not [command for command in runner.commands if "--token" in command]
+    assert reporter._owned == {}
+
+
+def test_cancel_prevents_late_value_send_after_quota_read():
+    entered, release = threading.Event(), threading.Event()
+    runner = Runner()
+
+    class Quota:
+        def read_sessions(self, threads):
+            entered.set()
+            assert release.wait(2)
+            return {"s": 50}
+
+    home = Path("~/.hermes").expanduser()
+    profile = str(uuid.uuid5(uuid.NAMESPACE_URL, str((home / "state.db").resolve())))
+    reporter = SidebarReporter(
+        enabled=True, quota_enabled=True, quota_reader=Quota(), runner=runner, adapter=Adapter()
+    )
+    data = {
+        "panes": [
+            {
+                "pane_id": "p1",
+                "terminal_id": "t1",
+                "status": "matched",
+                "profile": profile,
+                "session": {"id": "s", "total_tokens": 42},
+            }
+        ]
+    }
+    worker = threading.Thread(target=reporter.publish, args=(data,))
+    worker.start()
+    try:
+        assert entered.wait(1)
+        reporter.cancel()
+    finally:
+        release.set()
+        worker.join(2)
+    reporter.close()
+    assert not [cmd for cmd in runner.commands if "--token" in cmd]
 
 
 @pytest.mark.parametrize(

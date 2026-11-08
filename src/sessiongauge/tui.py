@@ -363,13 +363,46 @@ def render_frame(data, state, width=80, now=None, height=None, config=None):
     return [_clip(line, width) for line in lines]
 
 
-def _worker(config, collector_factory, messages, stop, refresh, interval, profile):
+class _WorkerLifecycle:
+    """SQLiteの所有権を移さず、公開済みcollectorへキャンセルだけを伝える。"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cancelled = False
+        self._collector = None
+
+    def register(self, collector):
+        with self._lock:
+            cancelled = self._cancelled
+            if not cancelled:
+                self._collector = collector
+        if cancelled:
+            self._cancel(collector)
+        return not cancelled
+
+    @staticmethod
+    def _cancel(collector):
+        cancel = getattr(collector, "cancel", None)
+        if cancel is not None:
+            cancel()
+
+    def cancel(self):
+        with self._lock:
+            self._cancelled = True
+            collector = self._collector
+        if collector is not None:
+            self._cancel(collector)
+
+
+def _worker(config, collector_factory, messages, stop, refresh, interval, profile, lifecycle=None):
     collector = None
     try:
         while not stop.is_set():
             try:
                 if collector is None:
                     collector = collector_factory(config)
+                    if lifecycle is not None and not lifecycle.register(collector):
+                        break
                 data = collector.collect()
                 # monitor接続はCollectorを所有するこのワーカー内でのみ参照する。
                 monitor = getattr(collector, "monitor", None)
@@ -540,6 +573,7 @@ def _worker(config, collector_factory, messages, stop, refresh, interval, profil
 
 def run_tui(config, collector_factory, *, screen_runner=None, interval=None, profile=None):
     messages, stop, refresh = queue.Queue(), threading.Event(), threading.Event()
+    lifecycle = _WorkerLifecycle()
     worker = threading.Thread(
         target=_worker,
         args=(
@@ -550,6 +584,7 @@ def run_tui(config, collector_factory, *, screen_runner=None, interval=None, pro
             refresh,
             interval or config.poll_interval_seconds,
             profile,
+            lifecycle,
         ),
         daemon=True,
     )
@@ -597,5 +632,6 @@ def run_tui(config, collector_factory, *, screen_runner=None, interval=None, pro
     finally:
         stop.set()
         refresh.set()
+        lifecycle.cancel()
         worker.join(timeout=10)
     return 0

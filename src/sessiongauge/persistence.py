@@ -198,6 +198,7 @@ class MonitorDB:
         c = self.connection
         run_id = run_id or "default"
         with c:
+            self._begin_pane_write()
             latest = c.execute(
                 "SELECT MAX(collected_at) FROM snapshots WHERE profile_id=?", (profile_id,)
             ).fetchone()[0]
@@ -457,6 +458,17 @@ class MonitorDB:
             previous = c.execute(
                 "SELECT title FROM panes WHERE endpoint=? AND pane_id=? AND terminal_id IS ?", key
             ).fetchone()
+            last_seen = (
+                c.execute(
+                    "SELECT last_seen FROM panes WHERE endpoint=? AND pane_id=? AND terminal_id IS ?",
+                    key,
+                ).fetchone()[0]
+                if previous
+                else None
+            )
+            # 同時刻の更新は従来どおり受け入れ、古い観測だけをpane単位で無視する。
+            if previous and collected_at < last_seen:
+                continue
             if previous:
                 c.execute(
                     "UPDATE panes SET title=?,cwd=?,last_seen=?,status=? WHERE endpoint=? AND pane_id=? AND terminal_id IS ?",
@@ -495,10 +507,19 @@ class MonitorDB:
 
     def record_panes(self, panes, collected_at):
         with self.connection:
+            self._begin_pane_write()
             latest = self.connection.execute("SELECT MAX(last_seen) FROM panes").fetchone()[0]
             if latest is not None and collected_at <= latest:
                 return
             self._record_panes(panes, collected_at)
+
+    def _begin_pane_write(self):
+        # SELECTだけでは暗黙のtransactionが始まらないため、観測前に書き込み権を取る。
+        if not self.connection.in_transaction:
+            self.connection.execute("BEGIN IMMEDIATE")
+        else:
+            # 呼び出し元のtransactionを確定せず、読み取り専用なら書き込みへ昇格する。
+            self.connection.execute("UPDATE panes SET last_seen=last_seen WHERE 0")
 
     def snapshots(self, profile_id, session_id):
         return self.connection.execute(

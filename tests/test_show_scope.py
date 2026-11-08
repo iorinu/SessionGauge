@@ -20,6 +20,53 @@ def _title_event(db, at, pane_id, old_title, new_title):
     )
 
 
+@pytest.fixture
+def old_duplicate_links_db(tmp_path):
+    # 旧実装で生じたNULL terminalの重複を、実際のSQLiteファイルに保存する。
+    with MonitorDB(tmp_path / "monitor.db") as db:
+        profile = db.register_profile("work", tmp_path / "source.db")
+        other_profile = db.register_profile("other", tmp_path / "other.db")
+        target = replace(pane(), terminal_id=None)
+        task = db.link_manual(target, profile, "session", 10)
+        db.connection.execute("INSERT INTO tasks(task_id,created_at) VALUES('other-task',10)")
+        db.connection.execute(
+            "INSERT INTO pane_session_links(endpoint,pane_id,terminal_id,task_id,profile_id,session_id,valid_from,source,confidence) "
+            "SELECT endpoint,pane_id,terminal_id,task_id,profile_id,session_id,11,'official','exact' FROM pane_session_links"
+        )
+        db.connection.commit()
+        db.record_panes([replace(target, title="new")], 20)
+        _title_event(db, 21, target.pane_id, "new", "legacy-new")
+        db.connection.commit()
+    return tmp_path, task, other_profile
+
+
+@pytest.mark.parametrize("difference", [None, "task_id", "profile_id", "session_id"])
+def test_show_old_duplicate_ownership(old_duplicate_links_db, capsys, difference):
+    path, task, other_profile = old_duplicate_links_db
+    with MonitorDB(path / "monitor.db") as db:
+        if difference:
+            value = {
+                "task_id": "other-task",
+                "profile_id": other_profile,
+                "session_id": "other-session",
+            }[difference]
+            db.connection.execute(
+                f"UPDATE pane_session_links SET {difference}=? WHERE id=2", (value,)
+            )
+            db.connection.commit()
+        before = db.connection.execute("SELECT * FROM pane_session_links ORDER BY id").fetchall()
+    _show(Config(data_dir=path), task)
+    changes = json.loads(capsys.readouterr().out)["name_changes"]
+    assert [event["new_title"] for event in changes] == (
+        [] if difference else ["new", "legacy-new"]
+    )
+    with MonitorDB(path / "monitor.db") as db:
+        assert (
+            db.connection.execute("SELECT * FROM pane_session_links ORDER BY id").fetchall()
+            == before
+        )
+
+
 @pytest.mark.parametrize("renamed_target", [False, True])
 def test_show_new_name_events_match_full_generation(tmp_path, capsys, renamed_target):
     target = replace(pane(), endpoint="endpoint-a", pane_id="shared", terminal_id="terminal-a")

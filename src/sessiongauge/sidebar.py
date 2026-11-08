@@ -8,7 +8,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import Lock
+from threading import Lock, RLock
 
 from sessiongauge.adapters.herdr import HerdrAdapter
 from sessiongauge.quota import QuotaReader, TokenQuotaEstimator
@@ -76,6 +76,9 @@ class SidebarReporter:
         self._estimate_generations = {}
         self._closed = False
         self._quota_lock = Lock()
+        self._send_lock = RLock()
+        self._cancel_lock = Lock()
+        self._cancelled = False
         self._quota_submitting = False
         self._last_quota_submit = None
         self.enabled = enabled
@@ -159,6 +162,15 @@ class SidebarReporter:
         return value
 
     def _send(self, pane_id, *, token=None, clear=False):
+        # 送信自体は順序付けるが、外部I/O中もcancelは状態を更新できる。
+        with self._send_lock:
+            with self._cancel_lock:
+                cancelled = self._cancelled
+            if cancelled and not clear:
+                return False
+            return self._send_active(pane_id, token=token, clear=clear)
+
+    def _send_active(self, pane_id, *, token=None, clear=False):
         if not self._supports():
             return False
         args = [
@@ -369,13 +381,17 @@ class SidebarReporter:
                     )
                 else:
                     token = f"{'N/A' if self.quota_mode == 'estimate' else '5h N/A'} · {token}"
-            if self._send(key[1], token=token):
-                self._owned[key] = sid
+            # sendロックを所有権記録まで保持し、closeのclear漏れを防ぐ。
+            with self._send_lock:
+                if self._send(key[1], token=token):
+                    self._owned[key] = sid
 
     def _clear_all(self):
-        for key in list(self._owned):
-            self._send(key[1], clear=True)
-            self._owned.pop(key, None)
+        # in-flight値送信が所有権を記録してからclearする。
+        with self._send_lock:
+            for key in list(self._owned):
+                self._send(key[1], clear=True)
+                self._owned.pop(key, None)
 
     def _sync_estimate_scopes(self, desired):
         """各paneの有効scopeを更新し、変化した世代の校正を破棄する。"""
@@ -401,7 +417,13 @@ class SidebarReporter:
             )
         return self._estimators[scope]
 
-    def close(self):
+    def cancel(self):
+        """別スレッドからの停止要求。送信や所有paneの走査は行わない。"""
+        with self._cancel_lock:
+            self._cancelled = True
+        self._stop_quota()
+
+    def _stop_quota(self):
         with self._quota_lock:
             if self._closed:
                 return
@@ -412,7 +434,12 @@ class SidebarReporter:
                 close_reader()
         finally:
             self._quota_executor.shutdown(wait=False, cancel_futures=True)
+
+    def close(self):
+        self.cancel()
+        self._stop_quota()
         if self.enabled:
+            # 先行中の送信完了後にclearし、cancel後の新規値送信は許可しない。
             self._clear_all()
 
     def _collect_estimates(self, threads, sessions_by_key, live, quota_targets):

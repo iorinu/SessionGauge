@@ -1,9 +1,78 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 from dataclasses import replace
 from types import SimpleNamespace
 
+import pytest
 from test_collector_acceptance import Collector, Config, MonitorDB, Sources, pane
+
+
+@pytest.mark.parametrize("method", ["record_panes", "record_poll"])
+def test_interleaved_observations_keep_latest_title_and_event(tmp_path, method):
+    with MonitorDB(tmp_path / "monitor.db") as first, MonitorDB(tmp_path / "monitor.db") as second:
+        profile = first.register_profile("test", tmp_path / "source.db")
+        original = replace(pane(), terminal_id=None, title="old")
+        connection = first.connection
+        injected = False
+
+        class InterleavedConnection:
+            def __enter__(self):
+                connection.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return connection.__exit__(*args)
+
+            def __getattr__(self, name):
+                return getattr(connection, name)
+
+            def execute(self, sql, parameters=()):
+                nonlocal injected
+                # ロック導入後は取得直前、導入前は読み取り直後に先行観測を確定する。
+                if sql == "BEGIN IMMEDIATE" and not injected:
+                    injected = True
+                    second.record_panes([original], 10)
+                cursor = connection.execute(sql, parameters)
+                if sql.startswith("SELECT title FROM panes") and not injected:
+                    prior = cursor.fetchone()
+                    assert not connection.in_transaction
+                    injected = True
+                    second.record_panes([original], 10)
+                    return SimpleNamespace(fetchone=lambda: prior)
+                return cursor
+
+        first.connection = InterleavedConnection()
+        try:
+            latest = replace(original, title="new")
+            if method == "record_panes":
+                first.record_panes([latest], 20)
+            else:
+                first.record_poll(
+                    profile_id=profile, sessions=[], panes=[latest], matches={}, collected_at=20
+                )
+        finally:
+            first.connection = connection
+        assert injected
+        assert connection.execute("SELECT title,first_seen,last_seen FROM panes").fetchall() == [
+            ("new", 10, 20)
+        ]
+        at, detail = connection.execute(
+            "SELECT at,detail FROM events WHERE kind='pane_title_changed'"
+        ).fetchone()
+        assert at == 20
+        assert json.loads(detail) == {
+            "endpoint": original.endpoint,
+            "pane_id": original.pane_id,
+            "terminal_id": None,
+            "old_title": "old",
+            "new_title": "new",
+        }
+        first.record_panes([replace(original, terminal_id="", title="empty")], 30)
+        assert connection.execute(
+            "SELECT terminal_id,title FROM panes ORDER BY last_seen"
+        ).fetchall() == [(None, "new"), ("", "empty")]
 
 
 def test_null_terminal_insert_is_atomic_between_collectors(tmp_path):
@@ -32,6 +101,32 @@ def test_null_terminal_insert_is_atomic_between_collectors(tmp_path):
         assert connection.execute(
             "SELECT terminal_id,first_seen,last_seen FROM panes"
         ).fetchall() == [(None, 10, 10)]
+
+
+@pytest.mark.parametrize("outer_transaction", [False, True])
+def test_pane_read_holds_writer_lock(tmp_path, outer_transaction):
+    with MonitorDB(tmp_path / "monitor.db") as first, MonitorDB(tmp_path / "monitor.db") as second:
+        second.connection.execute("PRAGMA busy_timeout=0")
+        connection = first.connection
+        if outer_transaction:
+            connection.execute("BEGIN")
+        checked = []
+
+        def check_lock(sql):
+            if sql.startswith("SELECT title FROM panes"):
+                assert connection.in_transaction
+                with pytest.raises(sqlite3.OperationalError, match="locked"):
+                    second.record_panes([replace(pane(), title="blocked")], 10)
+                checked.append(True)
+
+        connection.set_trace_callback(check_lock)
+        try:
+            first.record_panes([pane()], 20)
+        finally:
+            connection.set_trace_callback(None)
+        assert checked == [True]
+        second.record_panes([replace(pane(), title="next")], 30)
+        assert connection.execute("SELECT title,last_seen FROM panes").fetchone() == ("next", 30)
 
 
 def setup(tmp_path, initial_pane):
