@@ -188,7 +188,49 @@ def test_pane_title_event_includes_old_and_new_json_values(tmp_path):
         )
         kind, detail = db.connection.execute("SELECT kind,detail FROM events").fetchone()
         assert kind == "pane_title_changed"
-        assert json.loads(detail) == {"pane_id": "pane-1", "old_title": "old", "new_title": "new"}
+        assert json.loads(detail) == {
+            "endpoint": "local",
+            "pane_id": "pane-1",
+            "terminal_id": "term-1",
+            "old_title": "old",
+            "new_title": "new",
+        }
+
+
+def test_stale_profile_poll_does_not_roll_back_newer_pane_observation(tmp_path):
+    with MonitorDB(tmp_path / "monitor.db") as db:
+        first = db.register_profile("first", tmp_path / "first.db")
+        second = db.register_profile("second", tmp_path / "second.db")
+        session = _session(tokens=10)
+        db.record_poll(
+            profile_id=second,
+            sessions=[session],
+            panes=[_pane("newer")],
+            matches={},
+            collected_at=200,
+        )
+
+        db.record_poll(
+            profile_id=first,
+            sessions=[session],
+            panes=[_pane("older")],
+            matches={},
+            collected_at=100,
+        )
+
+        assert db.connection.execute(
+            "SELECT title,first_seen,last_seen FROM panes WHERE pane_id='pane-1'"
+        ).fetchone() == ("newer", 200, 200)
+        assert (
+            db.connection.execute(
+                "SELECT count(*) FROM events WHERE kind='pane_title_changed'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert db.connection.execute(
+            "SELECT collected_at,input_tokens FROM snapshots WHERE profile_id=? AND session_id='s1'",
+            (first,),
+        ).fetchone() == (100, 10)
 
 
 def test_source_values_are_sanitized_and_source_file_remains_unchanged(tmp_path):

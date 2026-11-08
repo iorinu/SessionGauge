@@ -8,6 +8,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Lock, RLock
 
 from sessiongauge.adapters.herdr import HerdrAdapter
 from sessiongauge.quota import QuotaReader, TokenQuotaEstimator
@@ -74,6 +75,11 @@ class SidebarReporter:
         self._estimate_scopes = {}
         self._estimate_generations = {}
         self._closed = False
+        self._quota_lock = Lock()
+        self._send_lock = RLock()
+        self._cancel_lock = Lock()
+        self._cancelled = False
+        self._quota_submitting = False
         self._last_quota_submit = None
         self.enabled = enabled
         self.ttl_ms = ttl_ms
@@ -156,6 +162,15 @@ class SidebarReporter:
         return value
 
     def _send(self, pane_id, *, token=None, clear=False):
+        # 送信自体は順序付けるが、外部I/O中もcancelは状態を更新できる。
+        with self._send_lock:
+            with self._cancel_lock:
+                cancelled = self._cancelled
+            if cancelled and not clear:
+                return False
+            return self._send_active(pane_id, token=token, clear=clear)
+
+    def _send_active(self, pane_id, *, token=None, clear=False):
         if not self._supports():
             return False
         args = [
@@ -330,6 +345,8 @@ class SidebarReporter:
                     for key, (sid, tokens) in live.items()
                     if key in quota_targets
                 }
+        if self._closed:
+            return
         for key in self._owned.keys() - live.keys():
             if key[1] in blocked:
                 continue
@@ -364,13 +381,17 @@ class SidebarReporter:
                     )
                 else:
                     token = f"{'N/A' if self.quota_mode == 'estimate' else '5h N/A'} · {token}"
-            if self._send(key[1], token=token):
-                self._owned[key] = sid
+            # sendロックを所有権記録まで保持し、closeのclear漏れを防ぐ。
+            with self._send_lock:
+                if self._send(key[1], token=token):
+                    self._owned[key] = sid
 
     def _clear_all(self):
-        for key in list(self._owned):
-            self._send(key[1], clear=True)
-            self._owned.pop(key, None)
+        # in-flight値送信が所有権を記録してからclearする。
+        with self._send_lock:
+            for key in list(self._owned):
+                self._send(key[1], clear=True)
+                self._owned.pop(key, None)
 
     def _sync_estimate_scopes(self, desired):
         """各paneの有効scopeを更新し、変化した世代の校正を破棄する。"""
@@ -396,13 +417,60 @@ class SidebarReporter:
             )
         return self._estimators[scope]
 
+    def cancel(self):
+        """別スレッドからの停止要求。送信や所有paneの走査は行わない。"""
+        with self._cancel_lock:
+            self._cancelled = True
+        self._stop_quota()
+
+    def _stop_quota(self):
+        with self._quota_lock:
+            if self._closed:
+                return
+            self._closed = True
+        try:
+            close_reader = getattr(self.quota_reader, "close", None)
+            if close_reader is not None:
+                close_reader()
+        finally:
+            self._quota_executor.shutdown(wait=False, cancel_futures=True)
+
     def close(self):
-        self._closed = True
-        self._quota_executor.shutdown(wait=False, cancel_futures=True)
+        self.cancel()
+        self._stop_quota()
         if self.enabled:
+            # 先行中の送信完了後にclearし、cancel後の新規値送信は許可しない。
             self._clear_all()
 
     def _collect_estimates(self, threads, sessions_by_key, live, quota_targets):
+        with self._quota_lock:
+            if self._closed or self._quota_submitting:
+                return
+            contexts = self._prepare_estimates(sessions_by_key, live, quota_targets)
+            if contexts is None:
+                return
+            self._quota_submitting = True
+        # submitとcloseが競合しても、外部処理中に状態lockを保持しない。
+        try:
+            future = self._quota_executor.submit(self.quota_reader.read_session_metadata, threads)
+        except RuntimeError:
+            with self._quota_lock:
+                if not self._closed:
+                    raise
+        else:
+            with self._quota_lock:
+                closed = self._closed
+                if not closed:
+                    self._quota_future = future
+                    self._quota_future_context = contexts
+            if closed:
+                future.cancel()
+        finally:
+            with self._quota_lock:
+                self._quota_submitting = False
+
+    def _prepare_estimates(self, sessions_by_key, live, quota_targets):
+        """完了済み結果の採用と次の要求の予約をcloseに対して不可分にする。"""
         if self._quota_future is not None and self._quota_future.done():
             try:
                 rows = self._quota_future.result()
@@ -453,8 +521,6 @@ class SidebarReporter:
                     "generation": self._estimate_generations.get(key, 0),
                 }
             if contexts and hasattr(self.quota_reader, "read_session_metadata"):
-                self._quota_future_context = contexts
                 self._last_quota_submit = now
-                self._quota_future = self._quota_executor.submit(
-                    self.quota_reader.read_session_metadata, threads
-                )
+                return contexts
+        return None
